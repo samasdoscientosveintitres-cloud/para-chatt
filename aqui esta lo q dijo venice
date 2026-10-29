@@ -1,0 +1,4144 @@
+A. DIAGNÓSTICO
+Antes de nada, un dato que condiciona todo: los archivos del proyecto no están adjuntos como ficheros. Lo que tengo es la auditoría de la ronda anterior, que contiene el código íntegro de cada módulo. Por tanto audito ese código (que es el proyecto real existente) y lo reconstruyo corregido. Donde la auditoría anterior se equivocaba, lo digo y aplico otra solución.
+
+A.1 Defectos confirmados
+#	Archivo / función	Causa	Impacto	Solución
+1	rate_limiter.py / retune()	Reemplaza self._sem por un Semaphore nuevo mientras hay workers sujetos al anterior. Los que sueltan llaman a release() sobre el nuevo	El semáforo se sobre-libera y el límite de concurrencia se pierde de forma permanente tras cualquier cambio de config	Gate propio con Condition y contador mutable; retune() pasa a ser async y notifica
+2	server.py / patch_config()	Llama retune() antes de workers.stop()	Dispara el defecto 1 en cada guardado	await del retune tras reiniciar workers
+3	server.py / join()	Firma dependencies=[Depends(auth)] if False else [] → evalúa a []	/api/join?open=true abre programas sin autorización cuando el servicio está expuesto	Depends(auth) real en la firma
+4	notifier.py / _writer() + disconnect()	Al fallar el envío, el escritor llama disconnect, que hace task.cancel() + await task sobre sí mismo	RuntimeError: Task cannot await on itself; el cliente queda en el diccionario	if client.task is not asyncio.current_task() antes de cancelar/esperar
+5	notifier.py / connect() + server.py	El saludo hello se difunde a todos los clientes al conectar uno	Cada pestaña nueva genera tráfico a las demás	send_hello(ws) dirigido por la cola del cliente recién conectado
+6	aggregator.py / confirm()	Si el job_id no está en _records, devuelve None y descarta la evidencia	Un informe del puente sobre un servidor aún no descubierto se pierde	Crea el registro bajo demanda
+7	aggregator.py / _merge()	En la rama was_confirmed devuelve siempre current	Evento WS en cada ciclo para cada confirmado; la UI re-renderiza sin cambios	Devuelve None salvo cambio real de estado u ocupación
+8	detection.py / evaluate()	Al haber informe vigente marca CONFIRMED sin re-comprobar el umbral	Subir min_value no invalida confirmaciones antiguas	Re-comprobación de umbral en evaluate()
+9	detection.py / _reports	Sin poda salvo al leer ese mismo job_id	Crecimiento ilimitado en sesiones largas	Poda por TTL + tope de entradas en register_report
+10	aggregator.py / get()	Devuelve registros EXPIRED con su ocupación vieja	El enlace se construye con datos rancios y se presenta como accesible	get_active(); join cae a unknown si está expirado
+11	bridge.py	Lanza BridgeError, pero el handler vive en server.py; en un FastAPI() pelado (tests) no está registrado	500 en vez del formato de error esperado	El router captura y devuelve JSONResponse él mismo
+12	main.py / --workers 0	0 entra en validate() y sale por rango [1,100]	SystemExit inesperado; el test que documenta el caso falla	Clamp explícito max(1, min(100, n)) con aviso
+13	config.py / load()	Un solo campo inválido descarta toda la configuración	Se pierden umbral, workers y proxies por un typo	Reparación campo a campo contra el valor por defecto
+14	config.py	Sin soporte de variables de entorno	Imposible configurar sin editar JSON	SNIPER_* con parseo tipado
+15	config.py / validate()	min_fps y hop_cooldown_s están en LIMITS pero la coerción float se decide por nombre en una tupla paralela	Añadir un float nuevo rompe silenciosamente	Tabla LIMITS con tipo explícito (tipo, min, max)
+16	hop_controller.py / _select()	Itera active() sin ordenar	Salta a un candidato peor antes que al de mayor puntuación	Orden por score descendente
+17	server.py / patch_config()	cfg.save() puede lanzar OSError sin captura	500 opaco y config en memoria distinta del disco	Captura y respuesta config_not_persisted
+18	ui/app.js	No envía X-Local-Token	Todos los POST fallan con 401 en cuanto se sale de loopback	Campo de token en localStorage + cabecera en api()
+19	ui/app.js	ws:// fijo	Rompe bajo https/wss	Protocolo derivado de location.protocol
+20	ui/app.js / refresh()	Repinta el estado vacío en cada sondeo	Pérdida de scroll y parpadeo	Solo si rendered.size === 0
+21	ui/app.js / openModal()	Etiqueta `[${cfg-min}+	JOIN]` con el texto en crudo del input	Muestra `[abc+
+22	tests/test_bridge.py	Monta el router en FastAPI() sin handler	Fallan los tests de error	Cubierto por el defecto 11
+23	tests/test_rate_limiter.py	limiter.retune(2, 4) sin await	Test roto tras el defecto 1	await
+24	tests/test_cli.py	Espera workers == 1 con --workers 0	Fallaba con el comportamiento previo	Cubierto por el defecto 12
+A.2 Riesgos potenciales (no reproducidos)
+Riesgo	Mitigación aplicada
+Retry-After en formato fecha HTTP	Se acepta solo numérico y se cae a backoff
+_cond.notify() sin bucles activos	retune es async y siempre corre en el loop
+Cola WS llena → dato viejo	Política explícita: descarta el más antiguo, contador dropped visible
+Token en localStorage	Solo se usa contra 127.0.0.1; nunca se registra
+expire_sweep sin notificar	El barrido publica expired para que la UI retire la tarjeta
+A.3 Errores de la auditoría anterior que corrijo
+Proponía Retry-After y backoff en el mismo método pero manteniendo el semáforo fijo: insuficiente, de ahí el gate mutable.
+Proponía BridgeError + handler global: incompleto para routers reutilizables.
+Proponía --workers 0 como error: contradice su propio test.
+B. ESTRUCTURA FINAL
+steal-a-egg-sniper/
+├── main.py
+├── server.py
+├── config.py
+├── models.py
+├── value_parser.py
+├── rate_limiter.py
+├── discovery.py
+├── worker_manager.py
+├── detection.py
+├── aggregator.py
+├── notifier.py
+├── join_handler.py
+├── bridge.py
+├── hop_controller.py
+├── requirements.txt
+├── pytest.ini
+├── README.md
+├── ui/index.html
+├── ui/styles.css
+├── ui/app.js
+├── bridge/SniperBridge.lua
+└── tests/
+    ├── conftest.py
+    ├── test_config.py
+    ├── test_parser.py
+    ├── test_rate_limiter.py
+    ├── test_discovery.py
+    ├── test_worker_manager.py
+    ├── test_detection.py
+    ├── test_aggregator.py
+    ├── test_notifier.py
+    ├── test_bridge.py
+    ├── test_join.py
+    ├── test_hop.py
+    ├── test_api.py
+    ├── test_cli.py
+    └── test_ui_contract.py
+C. CÓDIGO COMPLETO
+requirements.txt
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+aiohttp==3.11.11
+pytest==8.3.4
+pytest-asyncio==0.25.2
+httpx==0.28.1
+pytest.ini
+ini
+[pytest]
+asyncio_mode = auto
+testpaths = tests
+filterwarnings =
+    ignore::DeprecationWarning
+value_parser.py
+python
+"""Parser estricto de cantidades abreviadas.
+
+Coincidencia completa de la cadena (tras recortar). Formatos aceptados:
+    10B  10.5B  1T  10000000000  10,000,000,000  10B+  500M  1.25T  $10B  x10B
+
+Sufijos admitidos: K, M, B, T. No se admiten otros (Qa, Sx...) porque no está
+demostrado que Steal An Egg los use.
+
+Reglas de ambigüedad:
+  * Coma de miles solo si encaja con \\d{1,3}(,\\d{3})+.
+  * Coma única sin agrupación válida -> coma decimal (1,5B = 1.5B).
+  * Punto siempre decimal. Coma y punto juntos -> la coma es de miles.
+  * Un sufijo desconocido pegado invalida la cadena completa.
+"""
+from __future__ import annotations
+
+import re
+from decimal import Decimal, InvalidOperation
+
+_MULT: dict[str, Decimal] = {
+    "K": Decimal(10) ** 3,
+    "M": Decimal(10) ** 6,
+    "B": Decimal(10) ** 9,
+    "T": Decimal(10) ** 12,
+}
+
+_NUMBER = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)"
+_PATTERN = re.compile(
+    rf"^\$?\s*[xX]?\s*(?P<num>{_NUMBER})\s*(?P<suf>[KMBT])?\s*\+?\s*$",
+    re.IGNORECASE,
+)
+_GROUPED = re.compile(r"^\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
+
+_TIER_T = Decimal(10) ** 12
+_TIER_100B = Decimal(10) ** 11
+_TIER_50B = Decimal(5) * Decimal(10) ** 10
+_TIER_20B = Decimal(2) * Decimal(10) ** 10
+_TIER_10B = Decimal(10) ** 10
+
+
+def parse_value(raw: object) -> Decimal | None:
+    """Devuelve Decimal o None. Nunca lanza."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, Decimal):
+        value = raw
+    elif isinstance(raw, int):
+        value = Decimal(raw)
+    elif isinstance(raw, float):
+        if raw != raw or raw in (float("inf"), float("-inf")):
+            return None
+        value = Decimal(repr(raw))
+    elif isinstance(raw, str):
+        text = raw.strip().replace("\u00a0", " ").replace("\u202f", " ")
+        if not text:
+            return None
+        match = _PATTERN.match(text)
+        if not match:
+            return None
+        num = match.group("num")
+        if "," in num:
+            num = num.replace(",", "") if _GROUPED.match(num) or num.count(",") > 1 else num.replace(",", ".")
+        try:
+            value = Decimal(num)
+        except InvalidOperation:
+            return None
+        suffix = (match.group("suf") or "").upper()
+        if suffix:
+            value *= _MULT[suffix]
+    else:
+        return None
+
+    if value.is_nan() or value.is_infinite() or value < 0:
+        return None
+    return value
+
+
+def format_value(value: Decimal | int | None) -> str:
+    parsed = value if isinstance(value, Decimal) else parse_value(value)
+    if parsed is None:
+        return "—"
+    if parsed == 0:
+        return "0"
+    for suffix, mult in (("T", _MULT["T"]), ("B", _MULT["B"]), ("M", _MULT["M"]), ("K", _MULT["K"])):
+        if parsed >= mult:
+            text = format((parsed / mult).quantize(Decimal("0.01")), "f")
+            return text.rstrip("0").rstrip(".") + suffix
+    if parsed == parsed.to_integral_value():
+        return f"{parsed:,}"
+    return format(parsed.normalize(), "f")
+
+
+def classify(value: Decimal | None) -> str:
+    if value is None:
+        return "unknown"
+    if value >= _TIER_T:
+        return "1T+"
+    if value >= _TIER_100B:
+        return "100B+"
+    if value >= _TIER_50B:
+        return "50B+"
+    if value >= _TIER_20B:
+        return "20B+"
+    if value >= _TIER_10B:
+        return "10B+"
+    return "below-10B"
+
+
+def meets(value: Decimal | None, threshold: Decimal) -> bool:
+    if value is None or threshold is None:
+        return False
+    return value >= threshold
+models.py
+python
+"""Entidades y validadores de dominio."""
+from __future__ import annotations
+
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum
+
+JOB_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+MIN_PLACE_ID = 1
+MAX_PLACE_ID = 10**17
+
+
+def is_job_id(value: object) -> bool:
+    return isinstance(value, str) and bool(JOB_RE.match(value))
+
+
+def is_place_id(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and MIN_PLACE_ID <= value <= MAX_PLACE_ID
+
+
+class ServerState(str, Enum):
+    DISCOVERED = "discovered"
+    CANDIDATE = "candidate"
+    CONFIRMED = "confirmed"
+    EXPIRED = "expired"
+    UNAVAILABLE = "unavailable"
+
+
+class Verification(str, Enum):
+    UNKNOWN = "unknown"
+    CONFIRMED = "confirmed"
+
+
+class Occupancy(str, Enum):
+    JOINABLE = "joinable"
+    FULL = "full"
+    UNKNOWN = "unknown"
+
+
+STATE_RANK = {
+    ServerState.DISCOVERED: 1,
+    ServerState.CANDIDATE: 2,
+    ServerState.UNAVAILABLE: 2,
+    ServerState.CONFIRMED: 3,
+    ServerState.EXPIRED: 0,
+}
+
+
+@dataclass(slots=True)
+class Egg:
+    name: str
+    value: Decimal
+
+
+@dataclass(slots=True)
+class ServerInfo:
+    job_id: str
+    playing: int | None
+    max_players: int | None
+    ping: int | None
+    fps: float | None
+    seen_at: float = field(default_factory=time.time)
+
+    @property
+    def occupancy(self) -> Occupancy:
+        if self.playing is None or self.max_players is None:
+            return Occupancy.UNKNOWN
+        return Occupancy.JOINABLE if self.playing < self.max_players else Occupancy.FULL
+
+    @property
+    def free_slots(self) -> int | None:
+        if self.playing is None or self.max_players is None:
+            return None
+        return max(0, self.max_players - self.playing)
+
+
+@dataclass(slots=True)
+class ServerRecord:
+    job_id: str
+    place_id: int
+    state: ServerState
+    playing: int | None = None
+    max_players: int | None = None
+    ping: int | None = None
+    fps: float | None = None
+    score: float = 0.0
+    verification: Verification = Verification.UNKNOWN
+    eggs: list[Egg] = field(default_factory=list)
+    value: Decimal | None = None
+    discovered_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    confirmed_at: float | None = None
+    latency_ms: float | None = None
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+    @property
+    def occupancy(self) -> Occupancy:
+        if self.playing is None or self.max_players is None:
+            return Occupancy.UNKNOWN
+        return Occupancy.JOINABLE if self.playing < self.max_players else Occupancy.FULL
+
+    @property
+    def free_slots(self) -> int | None:
+        if self.playing is None or self.max_players is None:
+            return None
+        return max(0, self.max_players - self.playing)
+
+    def to_dict(self) -> dict:
+        from value_parser import classify, format_value
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "place_id": self.place_id,
+            "state": self.state.value,
+            "occupancy": self.occupancy.value,
+            "verification": self.verification.value,
+            "playing": self.playing,
+            "max_players": self.max_players,
+            "free_slots": self.free_slots,
+            "ping": self.ping,
+            "fps": None if self.fps is None else round(self.fps, 1),
+            "score": round(self.score, 2),
+            "value": str(self.value) if self.value is not None else None,
+            "value_label": format_value(self.value),
+            "value_tier": classify(self.value),
+            "eggs": [{"name": e.name, "value": str(e.value)} for e in self.eggs],
+            "discovered_at": self.discovered_at,
+            "updated_at": self.updated_at,
+            "confirmed_at": self.confirmed_at,
+            "latency_ms": None if self.latency_ms is None else round(self.latency_ms, 1),
+        }
+config.py
+python
+"""Configuración persistente, validada, atómica y con soporte de entorno."""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import secrets
+import tempfile
+import threading
+from dataclasses import dataclass, field
+from decimal import Decimal
+from pathlib import Path
+
+from value_parser import parse_value
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
+DEFAULT_PLACE_ID = 107778070777162
+
+ENV_PREFIX = "SNIPER_"
+MAX_REPAIRS = 32
+
+log = logging.getLogger("sniper.config")
+
+
+class ConfigError(ValueError):
+    def __init__(self, field_name: str, message: str):
+        super().__init__(f"{field_name}: {message}")
+        self.field_name = field_name
+        self.message = message
+
+
+PERSISTENT_FIELDS: tuple[str, ...] = (
+    "place_id", "min_value", "workers", "max_concurrency", "requests_per_second",
+    "page_limit", "max_pages", "request_timeout_s", "max_retries",
+    "max_ping", "min_fps", "min_free_slots", "require_joinable",
+    "missing_metrics", "emit_discovered", "record_ttl_s", "confirmed_ttl_s",
+    "history_limit", "bridge_enabled", "bridge_rate_per_min",
+    "auto_hop_enabled", "hop_cooldown_s", "hop_max_attempts",
+    "notify_sound", "paused", "enable_discovery",
+)
+
+SECRET_FIELDS: tuple[str, ...] = ("bridge_token",)
+BOOL_FIELDS = (
+    "require_joinable", "emit_discovered", "bridge_enabled",
+    "auto_hop_enabled", "notify_sound", "paused", "enable_discovery",
+)
+
+# nombre -> (tipo, mínimo, máximo)
+LIMITS: dict[str, tuple[str, float, float]] = {
+    "workers": ("int", 1, 100),
+    "max_concurrency": ("int", 1, 64),
+    "requests_per_second": ("float", 0.5, 40.0),
+    "max_pages": ("int", 1, 50),
+    "max_retries": ("int", 0, 6),
+    "max_ping": ("int", 20, 2000),
+    "min_fps": ("float", 0.0, 240.0),
+    "min_free_slots": ("int", 1, 50),
+    "record_ttl_s": ("int", 20, 3600),
+    "confirmed_ttl_s": ("int", 30, 7200),
+    "history_limit": ("int", 10, 2000),
+    "bridge_rate_per_min": ("int", 1, 600),
+    "hop_cooldown_s": ("float", 2.0, 120.0),
+    "hop_max_attempts": ("int", 1, 500),
+    "request_timeout_s": ("float", 2.0, 60.0),
+}
+
+_TRUTHY = {"1", "true", "yes", "on", "si", "sí"}
+
+
+def _as_bool(raw: object) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in _TRUTHY
+
+
+@dataclass
+class Config:
+    place_id: int = DEFAULT_PLACE_ID
+    min_value: str = "10B"
+
+    workers: int = 12
+    max_concurrency: int = 8
+    requests_per_second: float = 4.0
+    page_limit: int = 100
+    max_pages: int = 7
+    request_timeout_s: float = 12.0
+    max_retries: int = 3
+
+    max_ping: int = 250
+    min_fps: float = 45.0
+    min_free_slots: int = 1
+    require_joinable: bool = True
+    missing_metrics: str = "allow"
+    emit_discovered: bool = False
+
+    record_ttl_s: int = 90
+    confirmed_ttl_s: int = 300
+    history_limit: int = 300
+
+    bridge_enabled: bool = True
+    bridge_rate_per_min: int = 30
+    bridge_token: str = ""
+
+    auto_hop_enabled: bool = True
+    hop_cooldown_s: float = 12.0
+    hop_max_attempts: int = 40
+
+    notify_sound: bool = True
+    paused: bool = False
+    enable_discovery: bool = True
+
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    @property
+    def min_value_decimal(self) -> Decimal:
+        parsed = parse_value(self.min_value)
+        return parsed if parsed is not None else Decimal(10) ** 10
+
+    # ---------- serialización ----------
+    def to_dict(self) -> dict:
+        return {name: getattr(self, name) for name in PERSISTENT_FIELDS}
+
+    def secrets_dict(self) -> dict:
+        return {name: getattr(self, name) for name in SECRET_FIELDS}
+
+    def public_dict(self) -> dict:
+        data = self.to_dict()
+        data["min_value_decimal"] = str(self.min_value_decimal)
+        data["has_bridge_token"] = bool(self.bridge_token)
+        return data
+
+    # ---------- validación ----------
+    def _coerce_number(self, name: str, raw: object) -> int | float:
+        kind, low, high = LIMITS[name]
+        try:
+            value = int(raw) if kind == "int" else float(raw)
+        except (TypeError, ValueError):
+            raise ConfigError(name, f"tipo inválido: {raw!r}")
+        if kind == "float" and (value != value or value in (float("inf"), float("-inf"))):
+            raise ConfigError(name, "NaN o infinito")
+        if not low <= value <= high:
+            raise ConfigError(name, f"fuera de rango [{low}, {high}]: {value}")
+        return value
+
+    def validate(self) -> None:
+        if not isinstance(self.place_id, int) or isinstance(self.place_id, bool) or self.place_id < 1:
+            raise ConfigError("place_id", f"PlaceId inválido: {self.place_id!r}")
+        if parse_value(self.min_value) is None:
+            raise ConfigError("min_value", f"no interpretable: {self.min_value!r}")
+        for name in LIMITS:
+            setattr(self, name, self._coerce_number(name, getattr(self, name)))
+        if self.page_limit not in (10, 25, 50, 100):
+            raise ConfigError("page_limit", "solo 10, 25, 50 o 100")
+        if self.missing_metrics not in ("allow", "reject"):
+            raise ConfigError("missing_metrics", "debe ser 'allow' o 'reject'")
+        for name in BOOL_FIELDS:
+            setattr(self, name, _as_bool(getattr(self, name)))
+        if self.max_concurrency > self.workers:
+            self.max_concurrency = self.workers
+        if self.confirmed_ttl_s < self.record_ttl_s:
+            self.confirmed_ttl_s = self.record_ttl_s
+        if not self.bridge_token:
+            self.bridge_token = secrets.token_urlsafe(24)
+
+    def repair(self, exc: ConfigError) -> None:
+        default = Config()
+        if hasattr(default, exc.field_name):
+            setattr(self, exc.field_name, getattr(default, exc.field_name))
+
+    # ---------- entorno ----------
+    def apply_env(self, environ: dict | None = None) -> None:
+        source = environ if environ is not None else os.environ
+        for name in PERSISTENT_FIELDS + SECRET_FIELDS:
+            raw = source.get(ENV_PREFIX + name.upper())
+            if raw is None:
+                continue
+            if name in BOOL_FIELDS:
+                setattr(self, name, _as_bool(raw))
+            elif name in LIMITS:
+                setattr(self, name, LIMITS[name][0] and raw)
+            else:
+                setattr(self, name, raw)
+
+    # ---------- persistencia ----------
+    def save(self, path: Path | None = None) -> None:
+        target = Path(path or CONFIG_PATH)
+        payload = json.dumps({**self.to_dict(), **self.secrets_dict()}, indent=2, ensure_ascii=False)
+        with self._lock:
+            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".config-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_name, target)
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
+            except Exception:
+                if os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                raise
+
+    @classmethod
+    def load(cls, path: Path | None = None, environ: dict | None = None) -> "Config":
+        source = Path(path or CONFIG_PATH)
+        cfg = cls()
+        if source.exists():
+            try:
+                raw = json.loads(source.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("la raíz no es un objeto")
+                for key, value in raw.items():
+                    if key in PERSISTENT_FIELDS or key in SECRET_FIELDS:
+                        setattr(cfg, key, value)
+            except Exception as exc:
+                backup = source.with_suffix(".json.bak")
+                try:
+                    os.replace(source, backup)
+                except OSError:
+                    pass
+                log.warning("configuración ilegible (%s); respaldo en %s", exc, backup.name)
+        cfg.apply_env(environ)
+        for _ in range(MAX_REPAIRS):
+            try:
+                cfg.validate()
+                break
+            except ConfigError as exc:
+                log.warning("valor inválido (%s); se restaura el predeterminado", exc)
+                cfg.repair(exc)
+        return cfg
+
+
+def validate_port(port: int) -> int:
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError("port", f"puerto fuera de rango: {port!r}")
+    return port
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-7s | %(name)-22s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+rate_limiter.py
+python
+"""Limitador global: gate de concurrencia mutable + token bucket + bloqueo por 429."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from collections import deque
+
+log = logging.getLogger("sniper.limiter")
+
+
+class _Gate:
+    """Contador de concurrencia con límite modificable en caliente."""
+
+    def __init__(self, limit: int):
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def enter(self) -> None:
+        async with self._cond:
+            while self._active >= self._limit:
+                await self._cond.wait()
+            self._active += 1
+
+    async def leave(self) -> None:
+        async with self._cond:
+            if self._active > 0:
+                self._active -= 1
+            self._cond.notify()
+
+    async def set_limit(self, limit: int) -> None:
+        async with self._cond:
+            self._limit = max(1, int(limit))
+            self._cond.notify_all()
+
+
+class AdaptiveLimiter:
+    def __init__(self, rps: float, max_concurrency: int):
+        self._base_rate = max(0.5, float(rps))
+        self._rate = self._base_rate
+        self._gate = _Gate(max_concurrency)
+        self._tokens = self._base_rate
+        self._last = time.monotonic()
+        self._blocked_until = 0.0
+        self._errors = 0
+        self._completions: deque[float] = deque(maxlen=400)
+        self._lock = asyncio.Lock()
+
+    @property
+    def target_rps(self) -> float:
+        return round(self._rate, 2)
+
+    @property
+    def measured_rps(self) -> float:
+        now = time.monotonic()
+        recent = [t for t in self._completions if now - t <= 10.0]
+        return round(len(recent) / 10.0, 2)
+
+    @property
+    def blocked_for(self) -> float:
+        return round(max(0.0, self._blocked_until - time.monotonic()), 2)
+
+    @property
+    def concurrency(self) -> int:
+        return self._gate._limit
+
+    async def acquire(self) -> None:
+        await self._gate.enter()
+        try:
+            await self._wait_turn()
+        except asyncio.CancelledError:
+            await self._gate.leave()
+            raise
+
+    async def release(self) -> None:
+        self._completions.append(time.monotonic())
+        await self._gate.leave()
+
+    async def _wait_turn(self) -> None:
+        while True:
+            now = time.monotonic()
+            if now < self._blocked_until:
+                await asyncio.sleep(min(self._blocked_until - now, 2.0))
+                continue
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self._base_rate, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / max(self._rate, 0.01)
+            await asyncio.sleep(min(wait, 1.0))
+
+    def note_success(self) -> None:
+        self._errors = 0
+        if self._rate < self._base_rate:
+            self._rate = min(self._base_rate, self._rate + 0.05)
+
+    def note_rate_limited(self, retry_after: float | None = None) -> None:
+        self._rate = max(0.5, self._rate * 0.5)
+        self._tokens = 0.0
+        delay = retry_after if retry_after and retry_after > 0 else min(2 ** self._errors, 20) + random.uniform(0, 0.6)
+        self._blocked_until = max(self._blocked_until, time.monotonic() + min(delay, 30.0))
+        self._errors = min(self._errors + 1, 6)
+        log.warning("429: bloqueo global %.1fs, objetivo %.2f rps", self.blocked_for, self._rate)
+
+    def note_retryable(self, attempt: int) -> None:
+        delay = min(0.6 * (2 ** attempt), 8.0) + random.uniform(0, 0.4)
+        self._blocked_until = max(self._blocked_until, time.monotonic() + delay)
+        self._errors = min(self._errors + 1, 6)
+
+    async def retune(self, rps: float, max_concurrency: int) -> None:
+        self._base_rate = max(0.5, float(rps))
+        self._rate = min(self._rate, self._base_rate)
+        await self._gate.set_limit(max_concurrency)
+discovery.py
+python
+"""Descubrimiento con validación estricta y cursores opacos con profundidad real."""
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import deque
+from dataclasses import dataclass
+
+import aiohttp
+
+from config import Config
+from models import ServerInfo, is_job_id
+from rate_limiter import AdaptiveLimiter
+
+log = logging.getLogger("sniper.discovery")
+
+UA = "StealAEggSniper/2.1 (+local)"
+API = "https://games.roblox.com/v1/games/{place}/servers/Public"
+
+PERMANENT = {400, 401, 403, 404}
+
+
+@dataclass(slots=True)
+class FetchResult:
+    status: int
+    servers: list[ServerInfo]
+    next_cursor: str | None = None
+    error: str | None = None
+    retryable: bool = False
+    discarded: int = 0
+
+
+@dataclass(slots=True)
+class Cursor:
+    sort_order: int
+    depth: int
+    value: str | None = None
+
+
+class CursorPool:
+    def __init__(self, max_pages: int, orders: tuple[int, ...] = (1, 2)):
+        self._max_pages = max(1, max_pages)
+        self._orders = orders
+        self._queue: deque[Cursor] = deque()
+        self._inflight = 0
+        self._known: set[str] = set()
+        self._sweeps = 0
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    @property
+    def pending(self) -> int:
+        return len(self._queue) + self._inflight
+
+    @property
+    def sweeps(self) -> int:
+        return self._sweeps
+
+    async def next(self) -> Cursor | None:
+        async with self._lock:
+            if self._closed:
+                return None
+            if not self._queue:
+                if self._inflight > 0:
+                    return None
+                self._seed()
+            cursor = self._queue.popleft()
+            self._inflight += 1
+            return cursor
+
+    async def release(self, cursor: Cursor, result: FetchResult | None) -> None:
+        async with self._lock:
+            self._inflight = max(0, self._inflight - 1)
+            if self._closed or result is None:
+                return
+            nxt = result.next_cursor
+            if not nxt or not isinstance(nxt, str):
+                return
+            if cursor.depth + 1 >= self._max_pages:
+                return
+            if nxt in self._known:
+                return
+            self._known.add(nxt)
+            self._queue.append(Cursor(cursor.sort_order, cursor.depth + 1, nxt))
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._closed = True
+            self._queue.clear()
+
+    def _seed(self) -> None:
+        self._sweeps += 1
+        self._known.clear()
+        orders = self._orders if self._sweeps % 2 else tuple(reversed(self._orders))
+        for order in orders:
+            self._queue.append(Cursor(order, 0, None))
+        log.info("barrido #%d sembrado (max_pages=%d)", self._sweeps, self._max_pages)
+
+
+class RobloxClient:
+    def __init__(self, cfg: Config, limiter: AdaptiveLimiter, session: aiohttp.ClientSession):
+        self.cfg = cfg
+        self.limiter = limiter
+        self.session = session
+        self.counters = {"429": 0, "http_errors": 0, "invalid_rows": 0, "requests": 0}
+
+    async def fetch(self, cursor: Cursor) -> FetchResult:
+        params = {"limit": self.cfg.page_limit, "sortOrder": cursor.sort_order,
+                  "excludeFullGames": "true"}
+        if cursor.value:
+            params["cursor"] = cursor.value
+        url = API.format(place=self.cfg.place_id)
+
+        for attempt in range(self.cfg.max_retries + 1):
+            await self.limiter.acquire()
+            try:
+                self.counters["requests"] += 1
+                async with self.session.get(
+                    url, params=params,
+                    headers={"User-Agent": UA, "Accept": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=self.cfg.request_timeout_s),
+                ) as resp:
+                    status = resp.status
+                    if status == 429:
+                        self.counters["429"] += 1
+                        raw = resp.headers.get("Retry-After", "")
+                        retry_after = float(raw) if raw.replace(".", "", 1).isdigit() else None
+                        self.limiter.note_rate_limited(retry_after)
+                        if attempt >= self.cfg.max_retries:
+                            return FetchResult(status, [], retryable=True, error="429")
+                        continue
+                    if status in PERMANENT:
+                        self.counters["http_errors"] += 1
+                        self.limiter.note_success()
+                        return FetchResult(status, [], error=f"HTTP {status}")
+                    if status >= 500:
+                        self.counters["http_errors"] += 1
+                        self.limiter.note_retryable(attempt)
+                        if attempt >= self.cfg.max_retries:
+                            return FetchResult(status, [], retryable=True, error=f"HTTP {status}")
+                        continue
+                    if status != 200:
+                        self.counters["http_errors"] += 1
+                        return FetchResult(status, [], error=f"HTTP {status}")
+                    try:
+                        payload = await resp.json(content_type=None)
+                    except Exception:
+                        self.counters["http_errors"] += 1
+                        self.limiter.note_retryable(attempt)
+                        if attempt >= self.cfg.max_retries:
+                            return FetchResult(status, [], retryable=True, error="JSON inválido")
+                        continue
+                    self.limiter.note_success()
+                    return self._parse(payload, status)
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                self.counters["http_errors"] += 1
+                self.limiter.note_retryable(attempt)
+                log.debug("red (%s) intento %d/%d", type(exc).__name__, attempt + 1, self.cfg.max_retries + 1)
+                if attempt >= self.cfg.max_retries:
+                    return FetchResult(0, [], retryable=True, error=type(exc).__name__)
+            finally:
+                await self.limiter.release()
+        return FetchResult(0, [], retryable=True, error="reintentos agotados")
+
+    def _parse(self, payload: object, status: int) -> FetchResult:
+        if not isinstance(payload, dict):
+            return FetchResult(status, [], error="payload no es objeto")
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            return FetchResult(status, [], error="'data' no es lista")
+        nxt = payload.get("nextPageCursor")
+        if nxt is not None and not isinstance(nxt, str):
+            nxt = None
+
+        servers: list[ServerInfo] = []
+        discarded = 0
+        for row in rows:
+            if not isinstance(row, dict) or not is_job_id(row.get("id")):
+                discarded += 1
+                continue
+            servers.append(ServerInfo(
+                job_id=row["id"],
+                playing=_int_or_none(row.get("playing")),
+                max_players=_int_or_none(row.get("maxPlayers")),
+                ping=_int_or_none(row.get("ping")),
+                fps=_float_or_none(row.get("fps")),
+            ))
+        self.counters["invalid_rows"] += discarded
+        return FetchResult(status, servers, nxt, discarded=discarded)
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value < 0:
+        return None
+    return int(value)
+
+
+def _float_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value <= 0:
+        return None
+    return float(value)
+detection.py
+python
+"""Clasificación de estados y validación de evidencia externa."""
+from __future__ import annotations
+
+import time
+
+from config import Config
+from models import Egg, Occupancy, ServerInfo, ServerRecord, ServerState, Verification
+
+MAX_REPORTS = 500
+
+
+class Detector:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._reports: dict[str, tuple[list[Egg], float]] = {}
+
+    # ---------- evidencia ----------
+    def register_report(self, job_id: str, eggs: list[Egg]) -> bool:
+        if not eggs:
+            return False
+        best = max(eggs, key=lambda e: e.value)
+        if best.value < self.cfg.min_value_decimal:
+            return False
+        self._reports[job_id] = (eggs, time.time())
+        self._prune()
+        return True
+
+    def report_for(self, job_id: str) -> list[Egg]:
+        entry = self._reports.get(job_id)
+        if entry is None:
+            return []
+        eggs, ts = entry
+        if time.time() - ts > self.cfg.confirmed_ttl_s:
+            self._reports.pop(job_id, None)
+            return []
+        return eggs
+
+    def _prune(self) -> None:
+        now = time.time()
+        for job_id, (_, ts) in list(self._reports.items()):
+            if now - ts > self.cfg.confirmed_ttl_s:
+                self._reports.pop(job_id, None)
+        if len(self._reports) > MAX_REPORTS:
+            oldest = sorted(self._reports.items(), key=lambda kv: kv[1][1])[: len(self._reports) - MAX_REPORTS]
+            for job_id, _ in oldest:
+                self._reports.pop(job_id, None)
+
+    # ---------- puntuación ----------
+    def score(self, info: ServerInfo) -> float:
+        free = info.free_slots
+        if free is None or free <= 0:
+            return 0.0
+        ping = info.ping if info.ping is not None else self.cfg.max_ping
+        fps = info.fps if info.fps is not None else 30.0
+        return free * 12.0 + max(0.0, (self.cfg.max_ping - ping) / 10.0) + min(fps, 60.0) / 6.0
+
+    # ---------- evaluación ----------
+    def evaluate(self, info: ServerInfo, latency_ms: float) -> ServerRecord | None:
+        occupancy = info.occupancy
+        if occupancy is Occupancy.FULL:
+            if not self.cfg.emit_discovered:
+                return None
+            state = ServerState.UNAVAILABLE
+        elif occupancy is Occupancy.JOINABLE:
+            if not self._passes(info):
+                return None
+            state = ServerState.CANDIDATE
+        else:
+            if not self.cfg.emit_discovered:
+                return None
+            state = ServerState.DISCOVERED
+
+        record = ServerRecord(
+            job_id=info.job_id, place_id=self.cfg.place_id, state=state,
+            playing=info.playing, max_players=info.max_players,
+            ping=info.ping, fps=info.fps, score=self.score(info),
+            latency_ms=latency_ms, discovered_at=info.seen_at,
+        )
+
+        eggs = self.report_for(info.job_id)
+        if eggs:
+            best = max(eggs, key=lambda e: e.value)
+            # el umbral puede haber cambiado desde que se registró el informe
+            if best.value >= self.cfg.min_value_decimal:
+                record.eggs = eggs
+                record.value = best.value
+                record.verification = Verification.CONFIRMED
+                record.state = ServerState.CONFIRMED
+                record.confirmed_at = time.time()
+        return record
+
+    def _passes(self, info: ServerInfo) -> bool:
+        free = info.free_slots
+        if free is None or free < self.cfg.min_free_slots:
+            return False
+        if self.cfg.require_joinable and info.occupancy is not Occupancy.JOINABLE:
+            return False
+        reject_missing = self.cfg.missing_metrics == "reject"
+        if info.ping is None:
+            if reject_missing:
+                return False
+        elif info.ping > self.cfg.max_ping:
+            return False
+        if info.fps is None:
+            if reject_missing:
+                return False
+        elif info.fps < self.cfg.min_fps:
+            return False
+        return True
+aggregator.py
+python
+"""Agregación: actualización sin duplicar, prioridad de estados, caducidad."""
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from decimal import Decimal
+
+from config import Config
+from models import ServerRecord, ServerState, STATE_RANK, Verification
+
+
+class Aggregator:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._records: dict[str, ServerRecord] = {}
+        self.history: deque[dict] = deque(maxlen=cfg.history_limit)
+        self.on_change = None
+        self.on_expire = None
+        self.stats = {
+            "servers_seen": 0, "servers_evaluated": 0, "findings": 0,
+            "confirmed": 0, "duplicates": 0, "expired": 0,
+            "rate_limited": 0, "http_errors": 0, "invalid_rows": 0,
+            "started_at": time.time(),
+        }
+        self._lock = asyncio.Lock()
+
+    # ---------- contadores ----------
+    def count_seen(self, n: int) -> None:
+        self.stats["servers_seen"] += max(0, n)
+
+    def count_rate_limited(self) -> None:
+        self.stats["rate_limited"] += 1
+
+    # ---------- consulta ----------
+    def get(self, job_id: str) -> ServerRecord | None:
+        return self._records.get(job_id)
+
+    def get_active(self, job_id: str) -> ServerRecord | None:
+        record = self._records.get(job_id)
+        if record is None or record.state is ServerState.EXPIRED:
+            return None
+        return record
+
+    def active(self) -> list[ServerRecord]:
+        return [r for r in self._records.values() if r.state is not ServerState.EXPIRED]
+
+    def snapshot(self, limit: int = 60, confirmed_only: bool = False,
+                 min_value: Decimal | None = None) -> list[dict]:
+        items = self.active()
+        if confirmed_only:
+            items = [r for r in items if r.verification is Verification.CONFIRMED]
+        if min_value is not None:
+            items = [r for r in items if r.value is not None and r.value >= min_value]
+        items.sort(key=lambda r: (
+            r.verification is Verification.CONFIRMED,
+            float(r.value or 0),
+            r.score,
+            r.updated_at,
+        ), reverse=True)
+        return [r.to_dict() for r in items[:limit]]
+
+    def ui_stats(self) -> dict:
+        active = self.active()
+        return {
+            "servers_seen": self.stats["servers_seen"],
+            "servers_evaluated": self.stats["servers_evaluated"],
+            "candidates": sum(1 for r in active if r.state is ServerState.CANDIDATE),
+            "unavailable": sum(1 for r in active if r.state is ServerState.UNAVAILABLE),
+            "unknown_verification": sum(1 for r in active if r.verification is Verification.UNKNOWN),
+            "confirmed": sum(1 for r in active if r.verification is Verification.CONFIRMED),
+            "expired": self.stats["expired"],
+            "duplicates": self.stats["duplicates"],
+            "rate_limited": self.stats["rate_limited"],
+            "http_errors": self.stats["http_errors"],
+            "invalid_rows": self.stats["invalid_rows"],
+            "uptime_s": int(time.time() - self.stats["started_at"]),
+        }
+
+    # ---------- ingesta ----------
+    async def ingest(self, incoming: ServerRecord) -> ServerRecord:
+        async with self._lock:
+            current = self._records.get(incoming.job_id)
+            if current is None:
+                self._records[incoming.job_id] = incoming
+                self.stats["servers_evaluated"] += 1
+                if incoming.state in (ServerState.CANDIDATE, ServerState.CONFIRMED):
+                    self.stats["findings"] += 1
+                if incoming.verification is Verification.CONFIRMED:
+                    self.stats["confirmed"] += 1
+                self._remember(incoming)
+                notify = True
+            else:
+                self.stats["duplicates"] += 1
+                notify = self._merge(current, incoming)
+            if len(self._records) > 600:
+                self._evict_oldest()
+            result = self._records[incoming.job_id]
+        if notify and self.on_change:
+            await self.on_change(result, result)
+        return result
+
+    def _merge(self, current: ServerRecord, incoming: ServerRecord) -> bool:
+        prev_state = current.state
+        prev_occ = current.occupancy
+
+        current.playing = incoming.playing
+        current.max_players = incoming.max_players
+        current.ping = incoming.ping
+        current.fps = incoming.fps
+        current.score = incoming.score
+        current.updated_at = incoming.updated_at
+        current.latency_ms = incoming.latency_ms
+
+        if current.verification is Verification.CONFIRMED:
+            if current.state is not ServerState.CONFIRMED:
+                current.state = ServerState.CONFIRMED
+                self._remember(current)
+                return True
+            return current.occupancy is not prev_occ
+
+        if STATE_RANK[incoming.state] >= STATE_RANK[current.state] or current.state is ServerState.EXPIRED:
+            current.state = incoming.state
+            if incoming.verification is Verification.CONFIRMED:
+                current.verification = Verification.CONFIRMED
+                current.eggs = incoming.eggs
+                current.value = incoming.value
+                current.confirmed_at = incoming.confirmed_at
+                self.stats["confirmed"] += 1
+            if current.state is ServerState.CANDIDATE and prev_state is not ServerState.CANDIDATE:
+                self.stats["findings"] += 1
+            if current.state != prev_state:
+                self._remember(current)
+                return True
+        return current.occupancy is not prev_occ
+
+    async def confirm(self, job_id: str, eggs, value: Decimal) -> ServerRecord:
+        async with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                record = ServerRecord(job_id=job_id, place_id=self.cfg.place_id,
+                                      state=ServerState.CONFIRMED)
+                self._records[job_id] = record
+                self.stats["servers_evaluated"] += 1
+            was = record.verification is Verification.CONFIRMED
+            record.eggs = eggs
+            record.value = value
+            record.verification = Verification.CONFIRMED
+            record.state = ServerState.CONFIRMED
+            record.confirmed_at = time.time()
+            record.updated_at = time.time()
+            if not was:
+                self.stats["confirmed"] += 1
+                self.stats["findings"] += 1
+            self._remember(record)
+        if self.on_change:
+            await self.on_change(record, record)
+        return record
+
+    async def expire_sweep(self) -> list[str]:
+        now = time.time()
+        expired: list[str] = []
+        async with self._lock:
+            for job_id, record in list(self._records.items()):
+                ttl = self.cfg.confirmed_ttl_s if record.verification is Verification.CONFIRMED else self.cfg.record_ttl_s
+                if now - record.updated_at > ttl and record.state is not ServerState.EXPIRED:
+                    record.state = ServerState.EXPIRED
+                    expired.append(job_id)
+                    self.stats["expired"] += 1
+            for job_id, record in list(self._records.items()):
+                if record.state is ServerState.EXPIRED and now - record.updated_at > self.cfg.confirmed_ttl_s * 3:
+                    self._records.pop(job_id, None)
+        if expired and self.on_expire:
+            await self.on_expire(expired)
+        return expired
+
+    def _remember(self, record: ServerRecord) -> None:
+        self.history.appendleft({
+            "job_id": record.job_id, "state": record.state.value,
+            "verification": record.verification.value,
+            "value": str(record.value) if record.value is not None else None,
+            "at": time.time(),
+        })
+
+    def _evict_oldest(self) -> None:
+        oldest = sorted(self._records.values(), key=lambda r: r.updated_at)[:100]
+        for record in oldest:
+            if record.verification is not Verification.CONFIRMED:
+                self._records.pop(record.job_id, None)
+
+    def clear(self) -> None:
+        self._records.clear()
+        self.history.clear()
+notifier.py
+python
+"""Difusión con cola acotada por cliente. Descarte del mensaje más antiguo."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+
+from fastapi import WebSocket
+
+log = logging.getLogger("sniper.notifier")
+
+QUEUE_SIZE = 64
+
+
+class Client:
+    __slots__ = ("ws", "queue", "task", "dropped")
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_SIZE)
+        self.task: asyncio.Task | None = None
+        self.dropped = 0
+
+
+class Notifier:
+    def __init__(self) -> None:
+        self._clients: dict[WebSocket, Client] = {}
+
+    @property
+    def count(self) -> int:
+        return len(self._clients)
+
+    def _enqueue(self, client: Client, payload: str) -> None:
+        try:
+            client.queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            try:
+                client.queue.get_nowait()
+                client.queue.put_nowait(payload)
+                client.dropped += 1
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+    async def connect(self, ws: WebSocket) -> Client:
+        await ws.accept()
+        client = Client(ws)
+        self._clients[ws] = client
+        client.task = asyncio.create_task(self._writer(client), name="ws-writer")
+        return client
+
+    async def send_hello(self, ws: WebSocket, data: dict) -> None:
+        client = self._clients.get(ws)
+        if client:
+            self._enqueue(client, _payload("hello", data))
+
+    async def disconnect(self, ws: WebSocket) -> None:
+        client = self._clients.pop(ws, None)
+        if client and client.task and client.task is not asyncio.current_task():
+            client.task.cancel()
+            try:
+                await client.task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _writer(self, client: Client) -> None:
+        try:
+            while True:
+                message = await client.queue.get()
+                await client.ws.send_text(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("escritor WS caído: %r", exc)
+            await self.disconnect(client.ws)
+
+    def publish(self, event: str, data: dict) -> None:
+        if not self._clients:
+            return
+        payload = _payload(event, data)
+        for client in list(self._clients.values()):
+            self._enqueue(client, payload)
+
+    async def shutdown(self) -> None:
+        for ws in list(self._clients):
+            await self.disconnect(ws)
+
+
+def _payload(event: str, data: dict) -> str:
+    return json.dumps({"event": event, "ts": time.time(), "data": data}, default=str)
+join_handler.py
+python
+"""Enlaces de instancia. Generar != abrir != entrar."""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from urllib.parse import quote_plus
+
+from models import is_job_id, is_place_id
+
+WEB = "https://www.roblox.com/games/start?placeId={place}&gameInstanceId={job}"
+PROTO = "roblox://placeId={place}&gameInstanceId={job}"
+
+
+def build(job_id: str, place_id: int, occupancy: str = "unknown") -> dict:
+    if not is_place_id(place_id):
+        return {"ok": False, "code": "bad_place", "reason": f"PlaceId inválido: {place_id!r}",
+                "web": None, "protocol": None, "joinable": False}
+    if not is_job_id(job_id):
+        return {"ok": False, "code": "bad_job", "reason": "JobId ausente o con formato inválido",
+                "web": None, "protocol": None, "joinable": False}
+
+    place, job = quote_plus(str(place_id)), quote_plus(job_id)
+    web, proto = WEB.format(place=place, job=job), PROTO.format(place=place, job=job)
+
+    if occupancy == "full":
+        return {"ok": True, "code": "full", "joinable": False,
+                "reason": "Servidor lleno en la última comprobación: el enlace es válido, "
+                          "pero Roblox puede reasignarte a otra instancia.",
+                "web": web, "protocol": proto}
+    if occupancy == "unknown":
+        return {"ok": True, "code": "unknown_occupancy", "joinable": False,
+                "reason": "Ocupación desconocida: no se puede garantizar el destino.",
+                "web": web, "protocol": proto}
+    return {"ok": True, "code": "ok", "joinable": True, "reason": None,
+            "web": web, "protocol": proto}
+
+
+def open_protocol(protocol: str) -> dict:
+    """Lanza el deeplink. Éxito NO significa haberse unido."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(protocol)                       # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", protocol])
+        else:
+            subprocess.Popen(["xdg-open", protocol])
+    except Exception as exc:
+        return {"opened": False, "reason": f"el sistema no abrió roblox:// ({exc})"}
+    return {"opened": True, "reason": None}
+bridge.py
+python
+"""Ingestión de evidencia externa. Autocontenido: devuelve sus propios errores."""
+from __future__ import annotations
+
+import time
+from collections import deque
+
+from fastapi import APIRouter, Header, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from models import Egg, is_job_id
+from value_parser import parse_value
+
+MAX_BODY = 32 * 1024
+MAX_EGGS = 32
+MAX_NAME = 48
+
+
+class EggIn(BaseModel):
+    name: str = Field(min_length=1, max_length=MAX_NAME)
+    value: str = Field(min_length=1, max_length=24)
+
+
+class ReportIn(BaseModel):
+    job_id: str = Field(min_length=36, max_length=36)
+    place_id: int
+    eggs: list[EggIn] = Field(min_length=1, max_length=MAX_EGGS)
+
+
+def _error(status: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
+
+
+def build_router(ctx) -> APIRouter:
+    """ctx expone cfg, detector, aggregator, notifier."""
+    router = APIRouter()
+    hits: deque[float] = deque(maxlen=1000)
+
+    @router.post("/api/bridge/report")
+    async def report(body: ReportIn, request: Request, x_bridge_token: str = Header(default="")):
+        if not ctx.cfg.bridge_enabled:
+            return _error(503, "bridge_disabled", "el puente está desactivado")
+        length = int(request.headers.get("content-length") or 0)
+        if length > MAX_BODY:
+            return _error(413, "too_large", f"cuerpo mayor de {MAX_BODY} bytes")
+        if x_bridge_token != ctx.cfg.bridge_token:
+            return _error(401, "bad_token", "token de puente inválido")
+
+        now = time.time()
+        while hits and now - hits[0] > 60:
+            hits.popleft()
+        if len(hits) >= ctx.cfg.bridge_rate_per_min:
+            return _error(429, "rate_limited", "demasiados informes por minuto")
+        hits.append(now)
+
+        if body.place_id != ctx.cfg.place_id:
+            return _error(422, "bad_place", f"place_id {body.place_id} != {ctx.cfg.place_id}")
+        if not is_job_id(body.job_id):
+            return _error(422, "bad_job", "job_id no es un UUID válido")
+
+        eggs: list[Egg] = []
+        rejected = 0
+        for item in body.eggs:
+            parsed = parse_value(item.value)
+            if parsed is None:
+                rejected += 1
+                continue
+            eggs.append(Egg(item.name.strip()[:MAX_NAME], parsed))
+        if not eggs:
+            return _error(422, "no_valid_eggs", "ningún valor interpretable")
+
+        best = max(eggs, key=lambda e: e.value)
+        if best.value < ctx.cfg.min_value_decimal:
+            return JSONResponse({"ok": True, "confirmed": False, "accepted": len(eggs),
+                                 "best": str(best.value), "reason": "por debajo del umbral"})
+
+        if not ctx.detector.register_report(body.job_id, eggs):
+            return _error(422, "not_accepted", "informe no aceptado")
+
+        record = await ctx.aggregator.confirm(body.job_id, eggs, best.value)
+        ctx.notifier.publish("bridge", {
+            "job_id": body.job_id, "eggs": len(eggs), "best": str(best.value),
+            "known": True,
+        })
+        return JSONResponse({"ok": True, "confirmed": True, "accepted": len(eggs),
+                             "rejected": rejected, "best": str(best.value),
+                             "known": record is not None})
+
+    return router
+hop_controller.py
+python
+"""Auto-hop con máquina de estados explícita."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from enum import Enum
+
+from config import Config
+from join_handler import build, open_protocol
+from models import Verification
+
+log = logging.getLogger("sniper.hop")
+
+
+class HopState(str, Enum):
+    IDLE = "idle"
+    SELECTING = "selecting"
+    REQUESTED = "requested"
+    WAITING = "waiting"
+    SUCCESS = "success"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+
+
+class HopController:
+    def __init__(self, cfg: Config, aggregator, notifier, detector):
+        self.cfg = cfg
+        self.aggregator = aggregator
+        self.notifier = notifier
+        self.detector = detector
+        self.state = HopState.IDLE
+        self.task: asyncio.Task | None = None
+        self.attempts = 0
+        self.tried: set[str] = set()
+        self.current: str | None = None
+        self.last_reason: str | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def status(self) -> dict:
+        return {"running": self.running, "state": self.state.value, "attempts": self.attempts,
+                "current": self.current, "reason": self.last_reason}
+
+    def start(self) -> dict:
+        if not self.cfg.auto_hop_enabled:
+            return {"ok": False, "reason": "auto-hop desactivado en configuración"}
+        if self.running:
+            return {"ok": False, "reason": "ya está en marcha"}
+        self.attempts = 0
+        self.tried.clear()
+        self.current = None
+        self.last_reason = None
+        self.state = HopState.SELECTING
+        self.task = asyncio.create_task(self._run(), name="auto-hop")
+        return {"ok": True, "state": self.state.value}
+
+    async def stop(self, reason: str = "detenido por el usuario") -> dict:
+        if not self.running:
+            self.state = HopState.IDLE
+            return {"ok": True, "state": self.state.value}
+        self.last_reason = reason
+        task = self.task
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.task = None
+        self.state = HopState.IDLE
+        return {"ok": True, "state": self.state.value}
+
+    async def _run(self) -> None:
+        try:
+            while self.attempts < self.cfg.hop_max_attempts:
+                self.state = HopState.SELECTING
+                record = self._select()
+                if record is None:
+                    await asyncio.sleep(2.0)
+                    continue
+
+                self.attempts += 1
+                self.tried.add(record.job_id)
+                self.current = record.job_id
+                link = build(record.job_id, record.place_id, record.occupancy.value)
+                self.state = HopState.REQUESTED
+                self.notifier.publish("hop", {"state": self.state.value, "attempt": self.attempts,
+                                              "job_id": record.job_id, "web": link["web"],
+                                              "ok": link["ok"], "reason": link["reason"]})
+                if not link["ok"]:
+                    self.state = HopState.FAILED
+                    self.last_reason = link["reason"]
+                    continue
+
+                opened = open_protocol(link["protocol"])
+                if not opened["opened"]:
+                    self.state = HopState.FAILED
+                    self.last_reason = opened["reason"]
+                    continue
+
+                self.state = HopState.WAITING
+                self.notifier.publish("hop", {"state": self.state.value, "job_id": record.job_id})
+                deadline = time.monotonic() + self.cfg.hop_cooldown_s
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.5)
+                    eggs = self.detector.report_for(record.job_id)
+                    if eggs and max(e.value for e in eggs) >= self.cfg.min_value_decimal:
+                        self.state = HopState.SUCCESS
+                        return
+                self.state = HopState.TIMEOUT
+                self.last_reason = "sin confirmación del puente en la ventana de espera"
+            self.state = HopState.FAILED
+            self.last_reason = "límite de intentos alcanzado"
+        finally:
+            self.notifier.publish("hop_done", {"state": self.state.value,
+                                               "job_id": self.current,
+                                               "reason": self.last_reason})
+            self.task = None
+
+    def _select(self):
+        candidates = [r for r in self.aggregator.active()
+                      if r.job_id not in self.tried
+                      and r.occupancy.value == "joinable"
+                      and r.verification is Verification.UNKNOWN]
+        candidates.sort(key=lambda r: r.score, reverse=True)
+        return candidates[0] if candidates else None
+worker_manager.py
+python
+"""Ciclo de vida de workers: start/stop idempotentes, sin tareas huérfanas."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from aggregator import Aggregator
+from config import Config
+from detection import Detector
+from discovery import CursorPool, FetchResult, RobloxClient
+
+log = logging.getLogger("sniper.workers")
+
+
+class WorkerManager:
+    def __init__(self, cfg: Config, client: RobloxClient, detector: Detector, aggregator: Aggregator):
+        self.cfg = cfg
+        self.client = client
+        self.detector = detector
+        self.aggregator = aggregator
+        self.pool = CursorPool(cfg.max_pages)
+        self._tasks: dict[int, asyncio.Task] = {}
+        self._alive: set[int] = set()
+        self._watchdog: asyncio.Task | None = None
+        self._running = False
+        self._counter = 0
+
+    @property
+    def alive(self) -> int:
+        return len(self._alive)
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self.pool = CursorPool(self.cfg.max_pages)
+        for _ in range(self.cfg.workers):
+            self._spawn()
+        self._watchdog = asyncio.create_task(self._watch(), name="watchdog")
+        log.info("workers iniciados: %d (concurrencia %d)", self.cfg.workers, self.cfg.max_concurrency)
+
+    async def stop(self) -> None:
+        if not self._running and not self._tasks:
+            await self.pool.close()
+            return
+        self._running = False
+        await self.pool.close()
+        if self._watchdog:
+            self._watchdog.cancel()
+            try:
+                await self._watchdog
+            except asyncio.CancelledError:
+                pass
+            self._watchdog = None
+        tasks = list(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._alive.clear()
+        log.info("workers detenidos")
+
+    def _spawn(self) -> None:
+        self._counter += 1
+        wid = self._counter
+        self._tasks[wid] = asyncio.create_task(self._worker(wid), name=f"worker-{wid}")
+
+    async def _watch(self) -> None:
+        while self._running:
+            await asyncio.sleep(4.0)
+            for wid, task in list(self._tasks.items()):
+                if task.done():
+                    self._tasks.pop(wid, None)
+                    if task.cancelled():
+                        log.debug("worker %d cancelado", wid)
+                    elif task.exception():
+                        log.warning("worker %d murió: %r", wid, task.exception())
+                    if self._running:
+                        self._spawn()
+            await self.aggregator.expire_sweep()
+
+    async def _worker(self, wid: int) -> None:
+        self._alive.add(wid)
+        try:
+            while self._running:
+                if self.cfg.paused:
+                    await asyncio.sleep(0.3)
+                    continue
+                cursor = await self.pool.next()
+                if cursor is None:
+                    await asyncio.sleep(0.12)
+                    continue
+                result: FetchResult | None = None
+                started = time.monotonic()
+                try:
+                    result = await self.client.fetch(cursor)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("worker %d error no controlado: %r", wid, exc)
+                finally:
+                    await self.pool.release(cursor, result)
+
+                if result is None or not result.servers:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                self.aggregator.count_seen(len(result.servers))
+                for info in result.servers:
+                    record = self.detector.evaluate(info, (time.monotonic() - started) * 1000)
+                    if record is not None:
+                        await self.aggregator.ingest(record)
+        finally:
+            self._alive.discard(wid)
+server.py
+python
+"""Aplicación FastAPI. create_app recibe la configuración ya validada."""
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import urlparse
+
+import aiohttp
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, field_validator
+
+import bridge
+import join_handler
+from aggregator import Aggregator
+from config import Config, ConfigError
+from detection import Detector
+from discovery import RobloxClient
+from hop_controller import HopController
+from models import is_job_id
+from notifier import Notifier
+from rate_limiter import AdaptiveLimiter
+from value_parser import parse_value
+from worker_manager import WorkerManager
+
+log = logging.getLogger("sniper.server")
+UI_DIR = Path(__file__).parent / "ui"
+LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        self.status, self.code, self.message = status, code, message
+
+
+class Ctx:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.limiter = AdaptiveLimiter(cfg.requests_per_second, cfg.max_concurrency)
+        self.notifier = Notifier()
+        self.detector = Detector(cfg)
+        self.aggregator = Aggregator(cfg)
+        self.session: aiohttp.ClientSession | None = None
+        self.client: RobloxClient | None = None
+        self.workers: WorkerManager | None = None
+        self.hop: HopController | None = None
+
+
+class ConfigPatch(BaseModel):
+    min_value: str | None = None
+    workers: int | None = None
+    max_concurrency: int | None = None
+    requests_per_second: float | None = None
+    max_ping: int | None = None
+    min_fps: float | None = None
+    min_free_slots: int | None = None
+    missing_metrics: str | None = None
+    emit_discovered: bool | None = None
+    notify_sound: bool | None = None
+    bridge_enabled: bool | None = None
+
+    @field_validator("min_value")
+    @classmethod
+    def _check_min(cls, value):
+        if value is not None and parse_value(value) is None:
+            raise ValueError("valor mínimo no interpretable")
+        return value
+
+
+def create_app(cfg: Config, bind_host: str = "127.0.0.1") -> FastAPI:
+    ctx = Ctx(cfg)
+    require_token = bind_host not in LOOPBACK
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        connector = aiohttp.TCPConnector(limit=cfg.max_concurrency + 4,
+                                         limit_per_host=cfg.max_concurrency + 4)
+        ctx.session = aiohttp.ClientSession(connector=connector)
+        ctx.client = RobloxClient(cfg, ctx.limiter, ctx.session)
+        ctx.workers = WorkerManager(cfg, ctx.client, ctx.detector, ctx.aggregator)
+        ctx.hop = HopController(cfg, ctx.aggregator, ctx.notifier, ctx.detector)
+
+        async def on_change(record, _changed):
+            ctx.notifier.publish("record", record.to_dict())
+
+        async def on_expire(job_ids):
+            ctx.notifier.publish("expired", {"job_ids": job_ids})
+
+        ctx.aggregator.on_change = on_change
+        ctx.aggregator.on_expire = on_expire
+        if cfg.enable_discovery:
+            await ctx.workers.start()
+        try:
+            yield
+        finally:
+            if ctx.hop:
+                await ctx.hop.stop("apagado")
+            if ctx.workers:
+                await ctx.workers.stop()
+            await ctx.notifier.shutdown()
+            if ctx.session:
+                await ctx.session.close()
+
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.ctx = ctx
+    app.state.require_token = require_token
+
+    @app.exception_handler(ApiError)
+    async def _api_error(_: Request, exc: ApiError):
+        return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=exc.status)
+
+    @app.exception_handler(Exception)
+    async def _unhandled(_: Request, exc: Exception):
+        log.exception("error no controlado")
+        return JSONResponse({"error": {"code": "internal", "message": type(exc).__name__}}, status_code=500)
+
+    async def auth(x_local_token: str = Header(default="")) -> None:
+        if require_token and x_local_token != cfg.bridge_token:
+            raise ApiError(401, "unauthorized", "token local requerido fuera de loopback")
+
+    app.mount("/ui", StaticFiles(directory=UI_DIR), name="ui")
+
+    @app.get("/")
+    async def index():
+        return FileResponse(UI_DIR / "index.html")
+
+    @app.get("/api/state")
+    async def state():
+        return {
+            "paused": cfg.paused,
+            "workers": cfg.workers,
+            "workers_alive": ctx.workers.alive if ctx.workers else 0,
+            "rps_target": ctx.limiter.target_rps,
+            "rps_measured": ctx.limiter.measured_rps,
+            "blocked_for": ctx.limiter.blocked_for,
+            "concurrency": ctx.limiter.concurrency,
+            "stats": ctx.aggregator.ui_stats(),
+            "hop": ctx.hop.status() if ctx.hop else {"running": False, "state": "idle"},
+            "config": cfg.public_dict(),
+            "bridge": {"enabled": cfg.bridge_enabled, "has_token": bool(cfg.bridge_token)},
+            "auth_required": require_token,
+            "findings": ctx.aggregator.snapshot(),
+        }
+
+    @app.get("/api/findings")
+    async def findings(limit: int = 60, confirmed: bool = False, min_value: str | None = None):
+        threshold = parse_value(min_value) if min_value else None
+        if min_value and threshold is None:
+            raise ApiError(422, "bad_min_value", f"valor no interpretable: {min_value}")
+        return {"findings": ctx.aggregator.snapshot(min(200, max(1, limit)), confirmed, threshold)}
+
+    @app.get("/api/bridge/info")
+    async def bridge_info():
+        return {"enabled": cfg.bridge_enabled, "token": cfg.bridge_token,
+                "url": "http://127.0.0.1:8710/api/bridge/report", "place_id": cfg.place_id}
+
+    @app.post("/api/config", dependencies=[Depends(auth)])
+    async def patch_config(patch: ConfigPatch):
+        backup = cfg.to_dict()
+        old = (cfg.workers, cfg.max_concurrency, cfg.requests_per_second)
+        for key, value in patch.model_dump(exclude_none=True).items():
+            setattr(cfg, key, value)
+        try:
+            cfg.validate()
+        except ConfigError as exc:
+            for key, value in backup.items():
+                setattr(cfg, key, value)
+            raise ApiError(422, "invalid_config", str(exc))
+        persisted = True
+        try:
+            cfg.save()
+        except OSError as exc:
+            persisted = False
+            log.warning("no se pudo guardar la configuración: %s", exc)
+        if (cfg.workers, cfg.max_concurrency, cfg.requests_per_second) != old:
+            if ctx.workers and cfg.enable_discovery:
+                await ctx.workers.stop()
+                await ctx.workers.start()
+            await ctx.limiter.retune(cfg.requests_per_second, cfg.max_concurrency)
+        return {"ok": True, "persisted": persisted, "config": cfg.public_dict()}
+
+    @app.post("/api/pause", dependencies=[Depends(auth)])
+    async def pause():
+        cfg.paused = True
+        ctx.notifier.publish("paused", {"paused": True})
+        return {"ok": True, "paused": True}
+
+    @app.post("/api/resume", dependencies=[Depends(auth)])
+    async def resume():
+        cfg.paused = False
+        ctx.notifier.publish("paused", {"paused": False})
+        return {"ok": True, "paused": False}
+
+    @app.post("/api/clear", dependencies=[Depends(auth)])
+    async def clear():
+        ctx.aggregator.clear()
+        ctx.notifier.publish("cleared", {})
+        return {"ok": True}
+
+    @app.post("/api/hop/start", dependencies=[Depends(auth)])
+    async def hop_start():
+        if not ctx.hop:
+            raise ApiError(503, "not_ready", "servicio arrancando")
+        return ctx.hop.start()
+
+    @app.post("/api/hop/stop", dependencies=[Depends(auth)])
+    async def hop_stop():
+        if not ctx.hop:
+            raise ApiError(503, "not_ready", "servicio arrancando")
+        return await ctx.hop.stop()
+
+    @app.get("/api/join/{job_id}", dependencies=[Depends(auth)])
+    async def join(job_id: str, launch: bool = False):
+        if not is_job_id(job_id):
+            raise ApiError(422, "bad_job", "JobId con formato inválido")
+        record = ctx.aggregator.get_active(job_id)
+        occupancy = record.occupancy.value if record else "unknown"
+        link = join_handler.build(job_id, cfg.place_id, occupancy)
+        if launch and link["protocol"]:
+            link["open_result"] = join_handler.open_protocol(link["protocol"])
+        return link
+
+    @app.get("/api/health")
+    async def health():
+        return {"ok": True, "workers_alive": ctx.workers.alive if ctx.workers else 0,
+                "rps_measured": ctx.limiter.measured_rps}
+
+    @app.websocket("/ws")
+    async def ws_endpoint(ws: WebSocket):
+        origin = ws.headers.get("origin")
+        if origin and require_token:
+            if (urlparse(origin).hostname or "") not in LOOPBACK:
+                await ws.close(code=1008)
+                return
+        await ctx.notifier.connect(ws)
+        try:
+            await ctx.notifier.send_hello(ws, {"paused": cfg.paused})
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            await ctx.notifier.disconnect(ws)
+
+    app.include_router(bridge.build_router(ctx))
+    return app
+main.py
+python
+"""Punto de entrada único: valida, arranca y apaga."""
+from __future__ import annotations
+
+import argparse
+import logging
+import socket
+import sys
+
+import uvicorn
+
+from config import Config, ConfigError, setup_logging, validate_port
+from server import create_app
+
+log = logging.getLogger("sniper.main")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="steal-a-egg-sniper",
+                                     description="Descubridor de instancias de Steal An Egg")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8710)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--min-value", default=None)
+    parser.add_argument("--rps", type=float, default=None)
+    parser.add_argument("--no-discovery", action="store_true", help="no lanzar workers")
+    parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
+    return parser
+
+
+def validate_host(host: str) -> str:
+    if host in ("localhost", "::1", "[::1]"):
+        return "127.0.0.1"
+    try:
+        if host.count(".") == 3:
+            socket.inet_aton(host)
+        else:
+            socket.inet_pton(socket.AF_INET6, host)
+    except OSError:
+        raise SystemExit(f"error: host inválido: {host!r}")
+    return host
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    setup_logging(getattr(logging, args.log_level.upper()))
+
+    try:
+        validate_port(args.port)
+    except ConfigError as exc:
+        raise SystemExit(f"error: {exc}")
+    host = validate_host(args.host)
+
+    cfg = Config.load()
+
+    if args.workers is not None:
+        clamped = max(1, min(100, args.workers))
+        if clamped != args.workers:
+            log.warning("--workers %d ajustado a %d", args.workers, clamped)
+        cfg.workers = clamped
+    if args.min_value is not None:
+        cfg.min_value = args.min_value
+    if args.rps is not None:
+        cfg.requests_per_second = args.rps
+    if args.no_discovery:
+        cfg.enable_discovery = False
+
+    try:
+        cfg.validate()
+    except ConfigError as exc:
+        raise SystemExit(f"error de configuración: {exc}")
+
+    try:
+        cfg.save()
+    except OSError as exc:
+        log.warning("no se pudo guardar la configuración (%s); se continúa en memoria", exc)
+
+    app = create_app(cfg, host)
+    log.info("panel en http://%s:%d/ (workers=%d, rps=%.1f, concurrencia=%d)",
+             host, args.port, cfg.workers, cfg.requests_per_second, cfg.max_concurrency)
+    if host != "127.0.0.1":
+        log.info("fuera de loopback: los endpoints mutantes exigen X-Local-Token")
+    try:
+        uvicorn.run(app, host=host, port=args.port, log_level=args.log_level)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ui/index.html
+html
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steal a Egg Sniper</title>
+<link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot" id="dot"></span>STEAL A EGG <b>SNIPER</b></div>
+  <div class="stats" id="stats"></div>
+  <div class="actions">
+    <button id="btn-pause" class="btn">PAUSAR</button>
+    <button id="btn-hop" class="btn ghost">AUTO-HOP</button>
+    <button id="btn-sound" class="btn ghost">SONIDO: ON</button>
+  </div>
+</header>
+
+<main>
+  <aside id="panel">
+    <h2>ACCESO</h2>
+    <label for="cfg-token">Token local (fuera de loopback)</label>
+    <input id="cfg-token" type="password" autocomplete="off" spellcheck="false">
+    <button id="btn-token" class="btn wide">CARGAR DESDE SERVIDOR</button>
+    <p id="auth-msg" class="msg"></p>
+    <hr>
+    <h2>FILTROS</h2>
+    <label for="cfg-min">Valor mínimo</label>
+    <input id="cfg-min" spellcheck="false">
+    <label for="cfg-workers">Workers (1–100)</label>
+    <input id="cfg-workers" type="number" min="1" max="100" step="1">
+    <label for="cfg-conc">Concurrencia máx. (1–64)</label>
+    <input id="cfg-conc" type="number" min="1" max="64" step="1">
+    <label for="cfg-rps">Solicitudes/s objetivo</label>
+    <input id="cfg-rps" type="number" min="0.5" max="40" step="0.5">
+    <label for="cfg-ping">Ping máx. (ms)</label>
+    <input id="cfg-ping" type="number" min="20" max="2000" step="10">
+    <label for="cfg-missing">Métricas ausentes</label>
+    <select id="cfg-missing">
+      <option value="allow">Permitir (marcar desconocido)</option>
+      <option value="reject">Rechazar servidor</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="cfg-discovered"> Mostrar descubiertos/llenos</label>
+    <button id="btn-save" class="btn wide">GUARDAR</button>
+    <p id="save-msg" class="msg"></p>
+    <hr>
+    <h2>ESTADÍSTICAS</h2>
+    <div class="mini" id="mini"></div>
+    <hr>
+    <h2>PUENTE</h2>
+    <p class="hint">Sin fuente de huevos todo son candidatos, no huevos confirmados.</p>
+    <div class="mini" id="bridge-mini"></div>
+    <hr>
+    <h2>REGISTRO</h2>
+    <div id="log" aria-live="polite"></div>
+  </aside>
+
+  <section id="feed" aria-live="polite"></section>
+</main>
+
+<div id="modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="card">
+    <h1 id="modal-title">DETALLE DE INSTANCIA</h1>
+    <p id="modal-kind" class="kind"></p>
+    <dl>
+      <dt>Egg</dt><dd id="m-egg">—</dd>
+      <dt>Value</dt><dd id="m-val">—</dd>
+      <dt>Server ID</dt><dd id="m-sid">—</dd>
+      <dt>Time Found</dt><dd id="m-time">—</dd>
+      <dt>Verification</dt><dd id="m-ver">—</dd>
+      <dt>Slots</dt><dd id="m-slots">—</dd>
+      <dt>Accesibilidad</dt><dd id="m-acc">—</dd>
+    </dl>
+    <div class="mfoot">
+      <button id="m-join" class="join">[JOIN]</button>
+      <button id="m-copy" class="btn ghost">COPIAR ID</button>
+      <button id="m-web" class="btn ghost">ENLACE WEB</button>
+      <button id="m-close" class="btn ghost">CERRAR</button>
+    </div>
+    <p id="m-note" class="msg"></p>
+  </div>
+</div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>
+ui/styles.css
+css
+:root{
+  --bg:#0b0d10;--panel:#11151a;--line:#1e252e;--txt:#dfe6ee;--dim:#78838f;
+  --acc:#37e0a4;--warn:#ffb545;--bad:#ff5470;--radius:6px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--txt);font:13px/1.45 ui-monospace,"Cascadia Code",Consolas,monospace;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:16px;padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{font-size:13px;letter-spacing:.13em;color:var(--dim)}
+.brand b{color:var(--txt)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:7px}
+.dot.live{background:var(--acc);box-shadow:0 0 8px var(--acc)}
+.stats{display:flex;gap:14px;flex-wrap:wrap;margin-left:auto}
+.stats div{min-width:62px}
+.stats label{display:block;font-size:9px;color:var(--dim);letter-spacing:.1em}
+.stats span{font-size:13px;font-weight:600}
+.actions{display:flex;gap:6px}
+.btn{background:#1a2129;border:1px solid var(--line);color:var(--txt);padding:6px 11px;border-radius:5px;cursor:pointer;font:inherit;font-size:11px;letter-spacing:.05em}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.ghost{background:transparent}
+.btn.wide{width:100%;margin-top:8px}
+main{flex:1;display:flex;min-height:0}
+aside{width:262px;flex:0 0 262px;border-right:1px solid var(--line);padding:12px;overflow-y:auto;background:#0d1116}
+aside h2{font-size:10px;letter-spacing:.13em;color:var(--dim);margin:4px 0 7px}
+aside label{display:block;font-size:10px;color:var(--dim);margin:8px 0 3px;letter-spacing:.07em}
+aside input,aside select{width:100%;background:#0a0e12;border:1px solid var(--line);color:var(--txt);padding:5px 7px;border-radius:4px;font:inherit;font-size:12px}
+aside input:focus,aside select:focus{outline:none;border-color:var(--acc)}
+.chk{display:flex;gap:7px;align-items:center;margin-top:10px;font-size:11px;color:var(--txt)}
+.hint{font-size:10px;color:var(--dim);margin-bottom:6px}
+.msg{font-size:10px;color:var(--warn);margin-top:7px;min-height:13px}
+hr{border:none;border-top:1px solid var(--line);margin:12px 0}
+.mini div{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);padding:1px 0}
+.mini b{color:var(--txt)}
+#log{font-size:10px;color:var(--dim);max-height:200px;overflow-y:auto;white-space:pre-wrap}
+#feed{flex:1;overflow-y:auto;padding:11px;display:grid;grid-template-columns:repeat(auto-fill,minmax(292px,1fr));gap:9px;align-content:start}
+.f{border:1px solid var(--line);border-left:3px solid var(--dim);background:var(--panel);border-radius:var(--radius);padding:9px;cursor:pointer}
+.f:hover{transform:translateY(-1px);border-color:var(--acc)}
+.f.confirmed{border-left-color:var(--acc)}
+.f.hot{border-left-color:var(--warn)}
+.f.unavail{opacity:.62}
+.f .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:5px}
+.f .val{font-size:16px;font-weight:700}
+.f .val.unknown{color:var(--dim);font-size:13px;font-weight:400}
+.f .badge{font-size:9px;padding:2px 5px;border-radius:3px;border:1px solid var(--line);color:var(--dim);letter-spacing:.07em;white-space:nowrap}
+.f .badge.ok{color:var(--acc);border-color:#37e0a455}
+.f .badge.warn{color:var(--warn);border-color:#ffb54555}
+.f .badge.bad{color:var(--bad);border-color:#ff547055}
+.f .job{font-size:10px;color:var(--dim);word-break:break-all;margin:3px 0}
+.f .meta{display:flex;gap:10px;font-size:10px;color:var(--dim)}
+.f .meta b{color:var(--txt)}
+.empty{grid-column:1/-1;text-align:center;color:var(--dim);padding:48px 12px;font-size:12px}
+#modal{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;padding:14px;z-index:50}
+#modal.hidden{display:none}
+.card{width:min(430px,100%);max-height:92vh;overflow-y:auto;background:var(--panel);border:1px solid var(--acc);border-radius:9px;padding:18px}
+.card h1{font-size:12px;letter-spacing:.15em;color:var(--acc);margin-bottom:4px}
+.kind{font-size:10px;color:var(--dim);margin-bottom:12px}
+dl{display:grid;grid-template-columns:98px 1fr;gap:6px 9px;font-size:12px}
+dt{color:var(--dim);font-size:10px;letter-spacing:.08em;padding-top:2px}
+dd{word-break:break-all}
+.mfoot{display:flex;gap:7px;margin-top:14px;flex-wrap:wrap}
+.join{flex:1 1 130px;background:var(--acc);color:#06251b;border:none;padding:10px;border-radius:var(--radius);font:inherit;font-weight:700;letter-spacing:.09em;cursor:pointer}
+.join:disabled{background:#243029;color:#7f8c85;cursor:not-allowed}
+.join:not(:disabled):hover{filter:brightness(1.12)}
+@media (max-width:820px){
+  main{flex-direction:column}
+  aside{width:auto;flex:0 0 auto;max-height:44vh;border-right:none;border-bottom:1px solid var(--line)}
+  .stats{order:3;width:100%;margin-left:0}
+  #feed{grid-template-columns:1fr}
+  .card{width:100%}
+}
+ui/app.js
+javascript
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const WS_PROTO = location.protocol === 'https:' ? 'wss://' : 'ws://';
+const TOKEN_KEY = 'sniper-token';
+const feed = $('feed');
+
+const STAT_DEFS = [
+  ['candidates', 'CANDIDATOS'],
+  ['unknown_verification', 'SIN VERIFICAR'],
+  ['confirmed', 'CONFIRMADOS'],
+  ['servers_seen', 'FILAS VISTAS'],
+  ['servers_evaluated', 'EVALUADOS'],
+  ['rate_limited', 'LIMITADOS'],
+  ['http_errors', 'ERRORES'],
+];
+
+let formDirty = false;
+let soundOn = true;
+let authRequired = false;
+let lastBeep = { id: null, at: 0 };
+let audioCtx = null;
+let ws = null;
+let reconnectTimer = null;
+const rendered = new Map();
+
+function token() {
+  return localStorage.getItem(TOKEN_KEY) || '';
+}
+
+function log(message) {
+  const el = $('log');
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${message}\n` + el.textContent;
+  if (el.textContent.length > 6000) el.textContent = el.textContent.slice(0, 6000);
+}
+
+async function api(path, options) {
+  const opts = Object.assign({}, options || {});
+  const headers = Object.assign({}, opts.headers || {});
+  const current = token();
+  if (current) headers['X-Local-Token'] = current;
+  opts.headers = headers;
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+  if (!res.ok) {
+    const message = (body && body.error && body.error.message) || `HTTP ${res.status}`;
+    if (res.status === 401) $('auth-msg').textContent = 'token requerido o incorrecto';
+    throw new Error(message);
+  }
+  return body;
+}
+
+function fmt(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (n >= 1e12) return (n / 1e12).toFixed(2).replace(/\.?0+$/, '') + 'T';
+  if (n >= 1e9) return (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+  return n.toLocaleString();
+}
+
+function beep(freq) {
+  if (!soundOn) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    audioCtx = audioCtx || new AC();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = freq;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.25);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.25);
+  } catch { /* audio opcional */ }
+}
+
+function badge(text, cls) {
+  const span = document.createElement('span');
+  span.className = 'badge ' + cls;
+  span.textContent = text;
+  return span;
+}
+
+function buildCard(record) {
+  const confirmed = record.verification === 'confirmed';
+  const card = document.createElement('article');
+  card.className = 'f'
+    + (confirmed ? ' confirmed' : '')
+    + (confirmed && Number(record.value) >= 1e10 ? ' hot' : '')
+    + (record.state === 'unavailable' ? ' unavail' : '');
+  card.tabIndex = 0;
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  const value = document.createElement('span');
+  const label = fmt(record.value);
+  value.className = 'val' + (label ? '' : ' unknown');
+  value.textContent = label || 'sin datos';
+  row.appendChild(value);
+  row.appendChild(badge(confirmed ? 'CONFIRMADO' : 'CANDIDATO', confirmed ? 'ok' : 'warn'));
+  card.appendChild(row);
+
+  if (record.state === 'unavailable') card.appendChild(badge('LLENO', 'bad'));
+
+  const job = document.createElement('div');
+  job.className = 'job';
+  job.textContent = record.job_id;
+  card.appendChild(job);
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const parts = [
+    ['PLAYERS', `${record.playing ?? '?'}/${record.max_players ?? '?'}`],
+    ['PING', record.ping ?? '?'],
+    ['FREE', record.free_slots ?? '?'],
+  ];
+  for (const [key, val] of parts) {
+    const span = document.createElement('span');
+    span.textContent = key + ' ';
+    const strong = document.createElement('b');
+    strong.textContent = String(val);
+    span.appendChild(strong);
+    meta.appendChild(span);
+  }
+  card.appendChild(meta);
+
+  card.addEventListener('click', () => openModal(record));
+  card.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') openModal(record); });
+  return card;
+}
+
+function upsert(record) {
+  if (!record || !record.job_id) return;
+  const existing = rendered.get(record.job_id);
+  const card = buildCard(record);
+  rendered.set(record.job_id, { card, record });
+  if (existing && existing.card.parentNode) {
+    existing.card.replaceWith(card);
+  } else {
+    const empty = feed.querySelector('.empty');
+    if (empty) empty.remove();
+    feed.prepend(card);
+  }
+  while (feed.children.length > 200) feed.lastChild.remove();
+
+  if (record.verification === 'confirmed') {
+    const now = Date.now();
+    if (lastBeep.id !== record.id && now - lastBeep.at > 900) {
+      lastBeep = { id: record.id, at: now };
+      beep(Number(record.value) >= 1e10 ? 880 : 620);
+    }
+  }
+}
+
+function removeCard(jobId) {
+  const entry = rendered.get(jobId);
+  if (!entry) return;
+  entry.card.remove();
+  rendered.delete(jobId);
+}
+
+function renderEmpty(text) {
+  feed.replaceChildren();
+  const div = document.createElement('p');
+  div.className = 'empty';
+  div.textContent = text;
+  feed.appendChild(div);
+}
+
+function renderMini(holderId, rows) {
+  const holder = $(holderId);
+  holder.replaceChildren();
+  for (const [label, value] of rows) {
+    const div = document.createElement('div');
+    const span = document.createElement('span');
+    span.textContent = label;
+    const b = document.createElement('b');
+    b.textContent = value;
+    div.append(span, b);
+    holder.appendChild(div);
+  }
+}
+
+function renderStats(state) {
+  const holder = $('stats');
+  holder.replaceChildren();
+  const rows = STAT_DEFS.map(([key, title]) => [title, String(state.stats[key] ?? 0)]);
+  for (const [title, value] of rows) {
+    const wrap = document.createElement('div');
+    const lab = document.createElement('label');
+    lab.textContent = title;
+    const span = document.createElement('span');
+    span.textContent = value;
+    wrap.append(lab, span);
+    holder.appendChild(wrap);
+  }
+  renderMini('mini', [
+    ...rows,
+    ['RPS REAL', String(state.rps_measured)],
+    ['RPS OBJETIVO', String(state.rps_target)],
+  ]);
+  renderMini('bridge-mini', [
+    ['Estado', state.bridge.enabled ? 'ACTIVO' : 'INACTIVO'],
+    ['Token', state.bridge.has_token ? 'definido' : 'ausente'],
+    ['Bloqueo 429', `${state.blocked_for}s`],
+  ]);
+  authRequired = Boolean(state.auth_required);
+  $('auth-msg').textContent = authRequired && !token() ? 'servicio expuesto: introduce el token' : '';
+}
+
+function fillForm(config) {
+  if (formDirty) return;
+  $('cfg-min').value = config.min_value;
+  $('cfg-workers').value = config.workers;
+  $('cfg-conc').value = config.max_concurrency;
+  $('cfg-rps').value = config.requests_per_second;
+  $('cfg-ping').value = config.max_ping;
+  $('cfg-missing').value = config.missing_metrics;
+  $('cfg-discovered').checked = config.emit_discovered;
+}
+
+async function refresh() {
+  try {
+    const state = await api('/api/state');
+    soundOn = state.config.notify_sound;
+    $('dot').className = 'dot' + (state.paused ? '' : ' live');
+    $('btn-pause').textContent = state.paused ? 'REANUDAR' : 'PAUSAR';
+    $('btn-hop').textContent = state.hop.running ? 'DETENER HOP' : 'AUTO-HOP';
+    $('btn-sound').textContent = 'SONIDO: ' + (soundOn ? 'ON' : 'OFF');
+    renderStats(state);
+    fillForm(state.config);
+    const present = new Set();
+    for (const record of state.findings) {
+      present.add(record.job_id);
+      upsert(record);
+    }
+    for (const jobId of [...rendered.keys()]) {
+      if (!present.has(jobId)) removeCard(jobId);
+    }
+    if (rendered.size === 0) {
+      renderEmpty(state.paused ? 'Sniper en pausa.' : 'Sin resultados todavía.');
+    }
+  } catch (err) {
+    $('dot').className = 'dot';
+    log('error de estado: ' + err.message);
+  }
+}
+
+async function openModal(record) {
+  $('m-egg').textContent = record.eggs.length ? record.eggs.map((e) => e.name).join(', ') : 'no identificado';
+  $('m-val').textContent = record.value ? (fmt(record.value) || '—') : 'desconocido (sin verificar)';
+  $('m-sid').textContent = record.job_id;
+  $('m-time').textContent = new Date(record.discovered_at * 1000).toLocaleString();
+  $('m-ver').textContent = record.verification === 'confirmed' ? 'CONFIRMADO' : 'NO VERIFICADO';
+  $('m-slots').textContent = record.free_slots === null
+    ? 'desconocido' : `${record.free_slots} libres de ${record.max_players}`;
+  $('m-acc').textContent = record.occupancy === 'joinable' ? 'accesible'
+    : record.occupancy === 'full' ? 'lleno' : 'desconocido';
+  $('m-note').textContent = '';
+  $('modal-kind').textContent = record.verification === 'confirmed'
+    ? 'Huevo confirmado por fuente externa' : 'Candidato: instancia sin datos de contenido';
+  $('modal').classList.remove('hidden');
+
+  const joinBtn = $('m-join');
+  const webBtn = $('m-web');
+  joinBtn.disabled = true;
+  webBtn.disabled = true;
+  joinBtn.textContent = '[JOIN]';
+  joinBtn.onclick = null;
+  webBtn.onclick = null;
+
+  try {
+    const link = await api('/api/join/' + encodeURIComponent(record.job_id));
+    webBtn.disabled = !link.web;
+    if (link.web) webBtn.onclick = () => window.open(link.web, '_blank', 'noopener');
+    joinBtn.disabled = !link.protocol;
+    joinBtn.textContent = record.verification === 'confirmed'
+      ? `[${record.value_tier} | JOIN]` : '[JOIN]';
+    if (link.reason) $('m-note').textContent = link.reason;
+    joinBtn.onclick = async () => {
+      joinBtn.disabled = true;
+      try {
+        const result = await api('/api/join/' + encodeURIComponent(record.job_id) + '?launch=true');
+        $('m-note').textContent = result.open_result && result.open_result.opened
+          ? 'Deeplink lanzado. Abrir Roblox no garantiza entrar a esta instancia.'
+          : ((result.open_result && result.open_result.reason) || 'no se pudo lanzar el enlace');
+      } catch (err) {
+        $('m-note').textContent = err.message;
+      } finally {
+        joinBtn.disabled = !link.protocol;
+      }
+    };
+  } catch (err) {
+    $('m-note').textContent = err.message;
+  }
+
+  $('m-copy').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(record.job_id);
+      $('m-note').textContent = 'JobId copiado.';
+    } catch {
+      $('m-note').textContent = 'el navegador no permitió copiar.';
+    }
+  };
+}
+
+$('m-close').onclick = () => $('modal').classList.add('hidden');
+$('modal').addEventListener('click', (ev) => { if (ev.target.id === 'modal') $('modal').classList.add('hidden'); });
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') $('modal').classList.add('hidden'); });
+
+for (const id of ['cfg-min', 'cfg-workers', 'cfg-conc', 'cfg-rps', 'cfg-ping', 'cfg-missing', 'cfg-discovered']) {
+  $(id).addEventListener('input', () => { formDirty = true; });
+  $(id).addEventListener('change', () => { formDirty = true; });
+}
+
+$('cfg-token').value = token();
+$('cfg-token').addEventListener('input', () => {
+  const value = $('cfg-token').value.trim();
+  if (value) localStorage.setItem(TOKEN_KEY, value);
+  else localStorage.removeItem(TOKEN_KEY);
+});
+
+$('btn-token').onclick = async () => {
+  try {
+    const info = await api('/api/bridge/info');
+    $('cfg-token').value = info.token;
+    localStorage.setItem(TOKEN_KEY, info.token);
+    $('auth-msg').textContent = 'token cargado';
+    refresh();
+  } catch (err) {
+    $('auth-msg').textContent = err.message;
+  }
+};
+
+$('btn-save').onclick = async () => {
+  const button = $('btn-save');
+  button.disabled = true;
+  $('save-msg').textContent = '';
+  const payload = {
+    min_value: $('cfg-min').value.trim(),
+    workers: Number($('cfg-workers').value),
+    max_concurrency: Number($('cfg-conc').value),
+    requests_per_second: Number($('cfg-rps').value),
+    max_ping: Number($('cfg-ping').value),
+    missing_metrics: $('cfg-missing').value,
+    emit_discovered: $('cfg-discovered').checked,
+  };
+  try {
+    const result = await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    formDirty = false;
+    $('save-msg').textContent = result.persisted ? 'guardado' : 'guardado en memoria (disco falló)';
+    log('configuración guardada');
+  } catch (err) {
+    $('save-msg').textContent = err.message;
+  } finally {
+    button.disabled = false;
+    refresh();
+  }
+};
+
+$('btn-pause').onclick = async () => {
+  try {
+    const state = await api('/api/state');
+    await api(state.paused ? '/api/resume' : '/api/pause', { method: 'POST' });
+    refresh();
+  } catch (err) { log(err.message); }
+};
+
+$('btn-hop').onclick = async () => {
+  try {
+    const state = await api('/api/state');
+    await api(state.hop.running ? '/api/hop/stop' : '/api/hop/start', { method: 'POST' });
+    refresh();
+  } catch (err) { log(err.message); }
+};
+
+$('btn-sound').onclick = async () => {
+  soundOn = !soundOn;
+  $('btn-sound').textContent = 'SONIDO: ' + (soundOn ? 'ON' : 'OFF');
+  try {
+    await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notify_sound: soundOn }),
+    });
+  } catch (err) { log(err.message); }
+};
+
+function connect() {
+  if (ws && ws.readyState < 2) return;
+  ws = new WebSocket(`${WS_PROTO}${location.host}/ws`);
+  ws.onopen = () => { log('WS conectado'); refresh(); };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.event === 'record') upsert(msg.data);
+    else if (msg.event === 'expired') msg.data.job_ids.forEach(removeCard);
+    else if (msg.event === 'cleared') { rendered.clear(); renderEmpty('Limpio.'); }
+    else if (msg.event === 'hop') log(`hop ${msg.data.state}: ${msg.data.job_id || '-'}`);
+    else if (msg.event === 'hop_done') log(`hop finalizado: ${msg.data.state} ${msg.data.reason || ''}`);
+    else if (msg.event === 'bridge') log(`puente: ${msg.data.eggs} huevos en ${msg.data.job_id}`);
+    else if (msg.event === 'paused') refresh();
+  };
+  ws.onclose = () => {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+  ws.onerror = () => { if (ws) ws.close(); };
+}
+
+document.addEventListener('click', () => {
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}, { once: true });
+
+renderEmpty('Cargando…');
+refresh();
+connect();
+setInterval(() => { if (!document.hidden) refresh(); }, 2000);
+bridge/SniperBridge.lua
+lua
+--[[ SniperBridge (opcional)
+     Reporta al sniper los huevos visibles en la instancia actual.
+     Sin acceso a memoria: recorre instancias públicas de workspace y sus BillboardGui.
+     Requiere un ejecutor con capacidad HTTP. Si no la hay, avisa y termina.
+     TOKEN se obtiene de http://127.0.0.1:8710/api/bridge/info
+]]
+
+local URL = "http://127.0.0.1:8710/api/bridge/report"
+local TOKEN = "PEGA_AQUI_EL_TOKEN"
+local INTERVALO = 2.5
+local MIN_VALOR = 1e8
+local MAX_ENVIOS = 40
+local SUFIJOS = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
+
+local HttpService = game:GetService("HttpService")
+local JOB = game.JobId
+local PLACE = tonumber(game.PlaceId)
+
+local function resolverHttp()
+    if typeof(syn) == "table" and syn.request then return syn.request end
+    if typeof(http_request) == "function" then return http_request end
+    if typeof(request) == "function" then return request end
+    return nil
+end
+
+local enviar = resolverHttp()
+if not enviar then
+    warn("[SniperBridge] el ejecutor no expone request/http_request/syn.request; sin puente")
+    return
+end
+if JOB == nil or JOB == "" then
+    warn("[SniperBridge] sin JobId (servidor local o Studio)")
+    return
+end
+
+local function parsear(texto)
+    local limpio = tostring(texto):upper():gsub("[%$%+,%s]", "")
+    local numero, sufijo = limpio:match("^(%d+%.?%d*)([KMBT]?)$")
+    if not numero then return nil end
+    local valor = tonumber(numero)
+    if not valor then return nil end
+    if sufijo ~= "" then valor = valor * (SUFIJOS[sufijo] or 1) end
+    return valor
+end
+
+local function escanear()
+    local salida, vistos = {}, {}
+    local total = 0
+    for _, objeto in ipairs(workspace:GetDescendants()) do
+        if total >= MAX_ENVIOS then break end
+        if objeto:IsA("BillboardGui") and objeto.Enabled then
+            for _, hijo in ipairs(objeto:GetDescendants()) do
+                if hijo:IsA("TextLabel") then
+                    local valor = parsear(hijo.Text)
+                    if valor and valor >= MIN_VALOR then
+                        local dueno = objeto.Parent
+                        local nombre = (dueno and dueno.Name or "Egg"):sub(1, 48)
+                        local clave = nombre .. "|" .. tostring(math.floor(valor))
+                        if not vistos[clave] then
+                            vistos[clave] = true
+                            salida[#salida + 1] = { name = nombre, value = tostring(math.floor(valor)) }
+                        end
+                    end
+                end
+            end
+        end
+        total = total + 1
+    end
+    return salida
+end
+
+local ultimo = ""
+local fallos = 0
+
+task.spawn(function()
+    while true do
+        local huevos = escanear()
+        if #huevos > 0 then
+            local firma = HttpService:JSONEncode(huevos)
+            if firma ~= ultimo then
+                local ok, respuesta = pcall(function()
+                    return enviar({
+                        Url = URL, Method = "POST",
+                        Body = HttpService:JSONEncode({ job_id = JOB, place_id = PLACE, eggs = huevos }),
+                        Headers = { ["Content-Type"] = "application/json", ["X-Bridge-Token"] = TOKEN },
+                    })
+                end)
+                if ok and respuesta then
+                    ultimo = firma
+                    fallos = 0
+                else
+                    fallos = fallos + 1
+                    if fallos == 3 then
+                        warn("[SniperBridge] 3 fallos seguidos; ¿sniper apagado o token incorrecto?")
+                    end
+                end
+            end
+        end
+        task.wait(INTERVALO)
+    end
+end)
+
+print("[SniperBridge] activo en " .. JOB)
+README.md
+markdown
+# Steal a Egg Sniper
+
+Descubridor local de instancias públicas de **Steal An Egg** (Roblox). Encuentra servidores
+accesibles, los puntúa y ofrece un enlace a la instancia concreta.
+
+> La API pública de Roblox **no** informa qué huevos hay dentro de un servidor. Sin una fuente
+> adicional, todo lo que verás son **candidatos**. La confirmación llega por el puente opcional.
+
+## 1. Requisitos
+- Windows 11 (funciona también en Linux/macOS)
+- Python 3.11 o superior
+- Roblox Player, solo si vas a usar el botón de unión
+
+## 2. Entorno
+py -m venv .venv
+..venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+## 3. Arranque
+python main.py
+
+Escucha en `http://127.0.0.1:8710/`.
+python main.py --workers 20 --min-value 20B --rps 5
+python main.py --port 9000
+python main.py --no-discovery
+
+## 4. Panel
+Abre `http://127.0.0.1:8710/`.
+
+## 5. Valor mínimo
+Acepta `10B`, `10.5B`, `1T`, `10000000000`, `10,000,000,000`. Solo filtra datos **confirmados**.
+
+## 6. Estados
+| Estado | Significado |
+|---|---|
+| `discovered` | Instancia conocida, datos incompletos |
+| `candidate` | Cumple filtros de acceso |
+| `confirmed` | Informe válido con huevo ≥ umbral |
+| `unavailable` | Sin slots en la última comprobación |
+| `expired` | TTL agotado |
+
+## 7. Estadísticas
+- **FILAS VISTAS**: filas devueltas por la API, con repetidas.
+- **EVALUADOS**: JobId únicos.
+- **CANDIDATOS**: activos que cumplen filtros.
+- **SIN VERIFICAR**: activos sin evidencia.
+- **CONFIRMADOS**: activos con evidencia vigente.
+- **LIMITADOS**: respuestas 429, contadas una vez cada una.
+- **ERRORES**: HTTP no 429 y fallos de red definitivos.
+- **RPS REAL**: finalizaciones medidas en 10 s.
+
+## 8. Unión
+`[JOIN]` lanza `roblox://placeId=…&gameInstanceId=…`. También `ENLACE WEB` y `COPIAR ID`.
+Abrir el deeplink **no garantiza** entrar.
+
+## 9. Puente opcional
+1. Abre `/api/bridge/info` (o pulsa `CARGAR DESDE SERVIDOR`).
+2. Pega el token en `bridge/SniperBridge.lua`.
+3. Ejecútalo dentro del juego.
+
+El puente lee textos de `BillboardGui` visibles. Si el juego cambia su estructura, deja de encontrar
+valores: es una heurística, no una API.
+
+## 10. Fuera de loopback
+python main.py --host 0.0.0.0
+
+Los endpoints mutantes exigen `X-Local-Token`. Introdúcelo en el panel. No hay HTTPS ni
+autenticación de usuario: en red local es suficiente, en Internet no.
+
+## 11. Variables de entorno
+Cualquier campo admite `SNIPER_<CAMPO>` en mayúsculas (`SNIPER_WORKERS=8`,
+`SNIPER_MIN_VALUE=50B`). Precedencia: entorno > archivo > predeterminado.
+
+## 12. Problemas habituales
+| Síntoma | Solución |
+|---|---|
+| 429 constante | baja `--rps` o la concurrencia |
+| 0 filas | comprueba `/api/health` y el PlaceId |
+| JOIN sin efecto | Roblox Player ausente; usa el enlace web |
+| Nada confirmado | normal sin puente |
+| 401 en los POST | falta el token local |
+| Config rota | se respalda como `config.json.bak` |
+
+## 13. Pruebas
+python -m pytest -q
+
+## 14. Detener
+`Ctrl+C`.
+
+## 15. Límites reales
+- No se conocen los huevos de una instancia sin el puente.
+- Ventana de ~700 servidores por orden de paginación.
+- Los servidores VIP requieren cookie; no implementado.
+- No se garantiza la entrada a una instancia concreta.
+D. INSTALACIÓN (Windows 11)
+mkdir steal-a-egg-sniper
+cd steal-a-egg-sniper
+py -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pytest -q
+python main.py
+Abre http://127.0.0.1:8710/. Configura el umbral y pulsa GUARDAR. Para el puente: CARGAR DESDE SERVIDOR, copia el token a bridge/SniperBridge.lua y ejecútalo en el juego.
+
+E. PRUEBAS
+No ejecutadas. No dispongo de intérprete en esta sesión. Comando: python -m pytest -q. Todos los tests usan dobles de prueba; ninguno toca Roblox ni necesita credenciales.
+
+tests/conftest.py
+python
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from config import Config
+
+
+@pytest.fixture
+def cfg(tmp_path, monkeypatch):
+    import config as config_module
+    monkeypatch.setattr(config_module, "CONFIG_PATH", tmp_path / "config.json")
+    c = Config()
+    c.enable_discovery = False
+    c.bridge_token = "token-de-prueba"
+    c.validate()
+    return c
+tests/test_config.py
+python
+import json
+
+import pytest
+
+from config import Config, ConfigError, PERSISTENT_FIELDS
+
+
+def test_defaults_validos():
+    cfg = Config()
+    cfg.validate()
+    assert cfg.min_value_decimal == 10**10
+
+
+def test_to_dict_sin_lock():
+    data = Config().to_dict()
+    assert set(data) == set(PERSISTENT_FIELDS)
+    json.dumps(data)
+
+
+def test_public_dict_no_expone_secretos():
+    cfg = Config()
+    cfg.bridge_token = "secreto"
+    assert "bridge_token" not in cfg.public_dict()
+    assert cfg.public_dict()["has_bridge_token"] is True
+
+
+def test_guardado_atomico(tmp_path):
+    path = tmp_path / "c.json"
+    cfg = Config()
+    cfg.validate()
+    cfg.save(path)
+    assert json.loads(path.read_text())["min_value"] == cfg.min_value
+    assert not list(tmp_path.glob(".config-*.tmp"))
+
+
+def test_error_de_escritura_no_destruye(tmp_path, monkeypatch):
+    path = tmp_path / "c.json"
+    cfg = Config()
+    cfg.validate()
+    cfg.save(path)
+    original = path.read_text()
+
+    def boom(*a, **k):
+        raise OSError("disco lleno")
+
+    monkeypatch.setattr("os.replace", boom)
+    with pytest.raises(OSError):
+        cfg.save(path)
+    assert path.read_text() == original
+
+
+def test_json_corrupto(tmp_path, monkeypatch):
+    import config as config_module
+    path = tmp_path / "config.json"
+    path.write_text("{ no soy json")
+    monkeypatch.setattr(config_module, "CONFIG_PATH", path)
+    cfg = Config.load()
+    assert cfg.workers >= 1
+    assert path.with_suffix(".json.bak").exists()
+
+
+def test_campo_invalido_se_repara_sin_perder_resto(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"workers": 5000, "min_value": "50B", "max_ping": 100}))
+    cfg = Config.load(path, environ={})
+    assert cfg.workers == 12
+    assert cfg.min_value == "50B"
+    assert cfg.max_ping == 100
+
+
+def test_validacion_rangos():
+    cfg = Config()
+    cfg.workers = 5000
+    with pytest.raises(ConfigError):
+        cfg.validate()
+
+
+def test_min_value_invalido():
+    cfg = Config()
+    cfg.min_value = "mucho"
+    with pytest.raises(ConfigError):
+        cfg.validate()
+
+
+def test_page_limit_invalido():
+    cfg = Config()
+    cfg.page_limit = 33
+    with pytest.raises(ConfigError):
+        cfg.validate()
+
+
+def test_token_autogenerado():
+    cfg = Config()
+    cfg.validate()
+    assert len(cfg.bridge_token) > 20
+
+
+def test_env_override(tmp_path):
+    cfg = Config.load(tmp_path / "nada.json", environ={"SNIPER_WORKERS": "7", "SNIPER_MIN_VALUE": "20B"})
+    assert cfg.workers == 7
+    assert cfg.min_value == "20B"
+
+
+def test_validate_port():
+    from config import validate_port
+    assert validate_port(8710) == 8710
+    with pytest.raises(ConfigError):
+        validate_port(70000)
+tests/test_parser.py
+python
+from decimal import Decimal
+
+import pytest
+
+from value_parser import classify, format_value, meets, parse_value
+
+UMBRAL = Decimal(10) ** 10
+
+
+@pytest.mark.parametrize("raw,esperado", [
+    ("10B", Decimal(10) ** 10),
+    ("10.5B", Decimal("10500000000")),
+    ("1T", Decimal(10) ** 12),
+    ("10000000000", Decimal(10) ** 10),
+    ("10,000,000,000", Decimal(10) ** 10),
+    ("10B+", Decimal(10) ** 10),
+    ("500M", Decimal(5) * Decimal(10) ** 8),
+    ("1.25T", Decimal("1250000000000")),
+    ("$10B", Decimal(10) ** 10),
+    ("x10B", Decimal(10) ** 10),
+    ("1,5B", Decimal("1500000000")),
+])
+def test_aceptados(raw, esperado):
+    assert parse_value(raw) == esperado
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "mucho", "B", "-5B", "abc10B", "10Qa", "NaN", "inf"])
+def test_rechazados(raw):
+    assert parse_value(raw) is None
+
+
+def test_nan_none_bool():
+    assert parse_value(float("nan")) is None
+    assert parse_value(float("inf")) is None
+    assert parse_value(None) is None
+    assert parse_value(True) is None
+
+
+def test_999b_no_alcanza():
+    assert not meets(parse_value("9.99B"), UMBRAL)
+
+
+def test_igual_y_superior():
+    assert meets(parse_value("10B"), UMBRAL)
+    assert meets(parse_value("10.5B"), UMBRAL)
+
+
+def test_precision_grande():
+    assert parse_value("123456789012345678901") < parse_value("123456789012345678902")
+
+
+def test_format():
+    assert format_value(Decimal(10) ** 10) == "10B"
+    assert format_value(Decimal("1250000000000")) == "1.25T"
+    assert format_value(Decimal(0)) == "0"
+    assert format_value(None) == "—"
+    assert format_value(Decimal(1500)) == "1.5K"
+
+
+def test_classify():
+    assert classify(parse_value("10B")) == "10B+"
+    assert classify(parse_value("20B")) == "20B+"
+    assert classify(parse_value("50B")) == "50B+"
+    assert classify(parse_value("100B")) == "100B+"
+    assert classify(parse_value("1T")) == "1T+"
+    assert classify(parse_value("5B")) == "below-10B"
+    assert classify(None) == "unknown"
+tests/test_rate_limiter.py
+python
+import asyncio
+import time
+
+import pytest
+
+from rate_limiter import AdaptiveLimiter
+
+
+@pytest.mark.asyncio
+async def test_respeta_retry_after():
+    limiter = AdaptiveLimiter(50, 2)
+    limiter.note_rate_limited(1.0)
+    start = time.monotonic()
+    await limiter.acquire()
+    await limiter.release()
+    assert time.monotonic() - start >= 0.9
+
+
+@pytest.mark.asyncio
+async def test_backoff_sin_retry_after():
+    limiter = AdaptiveLimiter(50, 2)
+    limiter.note_rate_limited(None)
+    assert limiter.blocked_for > 0
+
+
+@pytest.mark.asyncio
+async def test_recuperacion_lenta():
+    limiter = AdaptiveLimiter(10, 2)
+    limiter.note_rate_limited(0.01)
+    bajo = limiter.target_rps
+    for _ in range(20):
+        limiter.note_success()
+    assert bajo < limiter.target_rps <= 10
+
+
+@pytest.mark.asyncio
+async def test_semaforo_limita_concurrencia():
+    limiter = AdaptiveLimiter(1000, 2)
+    activos = pico = 0
+
+    async def tarea():
+        nonlocal activos, pico
+        await limiter.acquire()
+        activos += 1
+        pico = max(pico, activos)
+        await asyncio.sleep(0.02)
+        activos -= 1
+        await limiter.release()
+
+    await asyncio.gather(*[tarea() for _ in range(10)])
+    assert pico <= 2
+
+
+@pytest.mark.asyncio
+async def test_rps_medida_es_real():
+    limiter = AdaptiveLimiter(1000, 4)
+    assert limiter.measured_rps == 0.0
+    await limiter.acquire()
+    await limiter.release()
+    assert limiter.measured_rps > 0
+
+
+@pytest.mark.asyncio
+async def test_retune_baja_objetivo_y_concurrencia():
+    limiter = AdaptiveLimiter(10, 8)
+    await limiter.retune(2, 3)
+    assert limiter.target_rps <= 2
+    assert limiter.concurrency == 3
+
+
+@pytest.mark.asyncio
+async def test_retune_no_pierde_permisos():
+    limiter = AdaptiveLimiter(1000, 4)
+    await limiter.acquire()
+    await limiter.retune(1000, 8)
+    await limiter.release()
+    assert limiter.concurrency == 8
+
+
+@pytest.mark.asyncio
+async def test_cancelacion_libera_gate():
+    limiter = AdaptiveLimiter(1000, 1)
+    limiter.note_rate_limited(5)
+
+    async def tarea():
+        await limiter.acquire()
+        await limiter.release()
+
+    task = asyncio.create_task(tarea())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert limiter._gate.active == 0
+tests/test_discovery.py
+python
+import asyncio
+
+import pytest
+
+from discovery import Cursor, CursorPool, RobloxClient
+from rate_limiter import AdaptiveLimiter
+
+JOB = "999dad42-3c76-4dcf-8b6f-298afcc35370"
+
+
+class FakeResponse:
+    def __init__(self, status, payload=None, headers=None, raw=None):
+        self.status = status
+        self._payload = payload
+        self.headers = headers or {}
+        self._raw = raw
+
+    async def json(self, content_type=None):
+        if self._raw is not None:
+            raise ValueError("json inválido")
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class FakeSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def get(self, *a, **k):
+        self.calls += 1
+        item = self.responses.pop(0) if self.responses else FakeResponse(500)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def make_client(cfg, responses):
+    cfg.max_retries = 1
+    return RobloxClient(cfg, AdaptiveLimiter(1000, 4), FakeSession(responses))
+
+
+@pytest.mark.asyncio
+async def test_respuesta_valida(cfg):
+    payload = {"data": [{"id": JOB, "playing": 6, "maxPlayers": 7, "ping": 58, "fps": 59.9}],
+               "nextPageCursor": "abc"}
+    result = await make_client(cfg, [FakeResponse(200, payload)]).fetch(Cursor(1, 0))
+    assert result.status == 200 and len(result.servers) == 1
+    assert result.servers[0].free_slots == 1
+    assert result.next_cursor == "abc"
+
+
+@pytest.mark.asyncio
+async def test_respuesta_vacia(cfg):
+    result = await make_client(cfg, [FakeResponse(200, {"data": [], "nextPageCursor": None})]).fetch(Cursor(1, 0))
+    assert result.servers == [] and result.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_json_invalido(cfg):
+    client = make_client(cfg, [FakeResponse(200, raw="x"), FakeResponse(200, raw="x")])
+    assert (await client.fetch(Cursor(1, 0))).error == "JSON inválido"
+
+
+@pytest.mark.asyncio
+async def test_timeout(cfg):
+    client = make_client(cfg, [asyncio.TimeoutError(), asyncio.TimeoutError()])
+    assert (await client.fetch(Cursor(1, 0))).retryable
+
+
+@pytest.mark.asyncio
+async def test_429_respeta_retry_after(cfg):
+    client = make_client(cfg, [FakeResponse(429, headers={"Retry-After": "3"}),
+                               FakeResponse(200, {"data": [], "nextPageCursor": None})])
+    assert (await client.fetch(Cursor(1, 0))).status == 200
+    assert client.limiter.blocked_for > 0
+
+
+@pytest.mark.asyncio
+async def test_500_reintenta(cfg):
+    client = make_client(cfg, [FakeResponse(500), FakeResponse(200, {"data": []})])
+    assert (await client.fetch(Cursor(1, 0))).status == 200
+
+
+@pytest.mark.asyncio
+async def test_400_no_reintenta(cfg):
+    session = FakeSession([FakeResponse(400)])
+    result = await RobloxClient(cfg, AdaptiveLimiter(1000, 2), session).fetch(Cursor(1, 0))
+    assert result.status == 400 and not result.retryable and session.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_campos_ausentes_son_none(cfg):
+    client = make_client(cfg, [FakeResponse(200, {"data": [{"id": JOB}]})])
+    server = (await client.fetch(Cursor(1, 0))).servers[0]
+    assert server.ping is None and server.fps is None and server.playing is None
+
+
+@pytest.mark.asyncio
+async def test_id_invalido_descartado(cfg):
+    client = make_client(cfg, [FakeResponse(200, {"data": [{"id": "no-uuid"}, {"id": 5}]})])
+    result = await client.fetch(Cursor(1, 0))
+    assert result.servers == [] and result.discarded == 2
+
+
+@pytest.mark.asyncio
+async def test_data_no_lista(cfg):
+    client = make_client(cfg, [FakeResponse(200, {"data": {"x": 1}})])
+    assert (await client.fetch(Cursor(1, 0))).error == "'data' no es lista"
+
+
+@pytest.mark.asyncio
+async def test_pool_no_duplica_cursores():
+    pool = CursorPool(max_pages=3)
+    first = await pool.next()
+    await pool.release(first, type("R", (), {"next_cursor": "a"})())
+    second = await pool.next()
+    await pool.release(second, type("R", (), {"next_cursor": "a"})())
+    third = await pool.next()
+    assert third.value != "a"
+
+
+@pytest.mark.asyncio
+async def test_profundidad_avanza():
+    pool = CursorPool(max_pages=2)
+    cursor = await pool.next()
+    assert cursor.depth == 0
+    await pool.release(cursor, type("R", (), {"next_cursor": "n1"})())
+    assert (await pool.next()).depth == 1
+
+
+@pytest.mark.asyncio
+async def test_fin_por_cursor_nulo():
+    pool = CursorPool(max_pages=9)
+    cursor = await pool.next()
+    await pool.release(cursor, type("R", (), {"next_cursor": None})())
+    assert all(c.value is None for c in pool._queue)
+
+
+@pytest.mark.asyncio
+async def test_cancelacion_libera_inflight():
+    pool = CursorPool(max_pages=2)
+    cursor = await pool.next()
+    assert pool.pending == 2
+    await pool.release(cursor, None)
+    assert pool.pending == 1
+tests/test_worker_manager.py
+python
+import asyncio
+
+import pytest
+
+from aggregator import Aggregator
+from detection import Detector
+from discovery import FetchResult
+from worker_manager import WorkerManager
+
+
+class StubClient:
+    def __init__(self):
+        self.calls = 0
+
+    async def fetch(self, cursor):
+        self.calls += 1
+        await asyncio.sleep(0.01)
+        return FetchResult(200, [])
+
+
+@pytest.fixture
+def manager(cfg):
+    cfg.workers = 3
+    cfg.max_concurrency = 2
+    return WorkerManager(cfg, StubClient(), Detector(cfg), Aggregator(cfg))
+
+
+@pytest.mark.asyncio
+async def test_start_y_stop(manager):
+    await manager.start()
+    assert manager.alive == 3
+    await manager.stop()
+    assert manager.alive == 0 and not manager.running
+
+
+@pytest.mark.asyncio
+async def test_start_idempotente(manager):
+    await manager.start()
+    await manager.start()
+    assert len(manager._tasks) == 3
+    assert len([t for t in asyncio.all_tasks() if t.get_name() == "watchdog"]) == 1
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_no_deja_tareas(manager):
+    await manager.start()
+    await manager.stop()
+    assert manager._tasks == {}
+    assert not [t for t in asyncio.all_tasks() if t.get_name().startswith("worker-")]
+
+
+@pytest.mark.asyncio
+async def test_stop_idempotente(manager):
+    await manager.stop()
+    await manager.stop()
+    assert manager.alive == 0
+
+
+@pytest.mark.asyncio
+async def test_alive_coherente(manager):
+    await manager.start()
+    await asyncio.sleep(0.05)
+    assert manager.alive == len(manager._alive)
+    await manager.stop()
+    assert manager.alive == 0
+tests/test_detection.py
+python
+import time
+from decimal import Decimal
+
+from detection import Detector
+from models import Egg, Occupancy, ServerInfo, ServerState, Verification
+
+JOB = "999dad42-3c76-4dcf-8b6f-298afcc35370"
+
+
+def info(**kw):
+    base = dict(job_id=JOB, playing=3, max_players=7, ping=40, fps=60.0)
+    base.update(kw)
+    return ServerInfo(**base)
+
+
+def test_descubierto_no_es_confirmado(cfg):
+    record = Detector(cfg).evaluate(info(), 1.0)
+    assert record.state is ServerState.CANDIDATE
+    assert record.verification is Verification.UNKNOWN
+    assert record.value is None
+
+
+def test_incompleto_es_discovered(cfg):
+    record = Detector(cfg).evaluate(info(playing=None, max_players=None), 1.0)
+    assert record.state is ServerState.DISCOVERED
+    assert record.occupancy is Occupancy.UNKNOWN
+
+
+def test_lleno_es_unavailable(cfg):
+    assert Detector(cfg).evaluate(info(playing=7), 1.0).state is ServerState.UNAVAILABLE
+
+
+def test_overfull_es_full(cfg):
+    assert Detector(cfg).evaluate(info(playing=8, max_players=7), 1.0).occupancy is Occupancy.FULL
+
+
+def test_politica_metricas_ausentes(cfg):
+    cfg.missing_metrics = "allow"
+    assert Detector(cfg).evaluate(info(ping=None), 1.0) is not None
+    cfg.missing_metrics = "reject"
+    assert Detector(cfg).evaluate(info(ping=None), 1.0) is None
+
+
+def test_ping_alto_rechazado(cfg):
+    assert Detector(cfg).evaluate(info(ping=900), 1.0) is None
+
+
+def test_valor_bajo_umbral_no_confirma(cfg):
+    detector = Detector(cfg)
+    detector.register_report(JOB, [Egg("Raro", Decimal(5) * 10**9)])
+    assert detector.evaluate(info(), 1.0).verification is Verification.UNKNOWN
+
+
+def test_valor_igual_confirma(cfg):
+    detector = Detector(cfg)
+    detector.register_report(JOB, [Egg("Raro", Decimal(10) ** 10)])
+    assert detector.evaluate(info(), 1.0).state is ServerState.CONFIRMED
+
+
+def test_umbral_subido_invalida_confirmacion(cfg):
+    detector = Detector(cfg)
+    detector.register_report(JOB, [Egg("Raro", Decimal(10) ** 10)])
+    cfg.min_value = "50B"
+    assert detector.evaluate(info(), 1.0).verification is Verification.UNKNOWN
+
+
+def test_informe_vacio_no_confirma(cfg):
+    assert Detector(cfg).register_report(JOB, []) is False
+
+
+def test_informe_caducado(cfg):
+    cfg.confirmed_ttl_s = 60
+    detector = Detector(cfg)
+    detector.register_report(JOB, [Egg("Raro", Decimal(10) ** 10)])
+    detector._reports[JOB] = (detector._reports[JOB][0], time.time() - 120)
+    assert detector.report_for(JOB) == []
+
+
+def test_job_distinto_no_mezcla(cfg):
+    detector = Detector(cfg)
+    detector.register_report("otro", [Egg("Raro", Decimal(10) ** 11)])
+    assert detector.evaluate(info(), 1.0).value is None
+
+
+def test_poda_por_tamano(cfg):
+    import detection
+    cfg.confirmed_ttl_s = 10_000
+    detector = Detector(cfg)
+    for i in range(detection.MAX_REPORTS + 20):
+        detector.register_report(f"j{i}", [Egg("X", Decimal(10) ** 10)])
+    assert len(detector._reports) <= detection.MAX_REPORTS
+tests/test_aggregator.py
+python
+import time
+
+import pytest
+
+from aggregator import Aggregator
+from models import ServerRecord, ServerState, Verification
+
+
+def record(job_id="j1", state=ServerState.CANDIDATE, value=None, verification=Verification.UNKNOWN):
+    return ServerRecord(job_id=job_id, place_id=1, state=state, playing=3, max_players=7,
+                        value=value, verification=verification)
+
+
+@pytest.mark.asyncio
+async def test_repetido_actualiza_sin_duplicar(cfg):
+    agg = Aggregator(cfg)
+    await agg.ingest(record())
+    await agg.ingest(record())
+    assert agg.stats["findings"] == 1
+    assert agg.stats["duplicates"] == 1
+    assert len(agg.active()) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmado_no_degradado(cfg):
+    agg = Aggregator(cfg)
+    await agg.ingest(record(state=ServerState.CONFIRMED, verification=Verification.CONFIRMED, value=10**10))
+    await agg.ingest(record())
+    stored = agg.get("j1")
+    assert stored.state is ServerState.CONFIRMED
+    assert stored.verification is Verification.CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_repetido_sin_cambio_no_notifica(cfg):
+    agg = Aggregator(cfg)
+    events = []
+
+    async def on_change(rec, _):
+        events.append(rec.job_id)
+
+    agg.on_change = on_change
+    await agg.ingest(record())
+    await agg.ingest(record())
+    assert events == ["j1"]
+
+
+@pytest.mark.asyncio
+async def test_cambio_de_ocupacion_notifica(cfg):
+    agg = Aggregator(cfg)
+    events = []
+
+    async def on_change(rec, _):
+        events.append(rec.job_id)
+
+    agg.on_change = on_change
+    await agg.ingest(record(state=ServerState.CONFIRMED, verification=Verification.CONFIRMED))
+    await agg.ingest(record(state=ServerState.CONFIRMED, verification=Verification.CONFIRMED,
+                            playing=7))
+    assert len(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_confirm_desconocido_crea_registro(cfg):
+    agg = Aggregator(cfg)
+    result = await agg.confirm("nuevo", [], 10**10)
+    assert result is not None
+    assert agg.get_active("nuevo") is not None
+
+
+@pytest.mark.asyncio
+async def test_caducidad_elimina_y_notifica(cfg):
+    cfg.record_ttl_s = 20
+    agg = Aggregator(cfg)
+    expired_ids = []
+
+    async def on_expire(ids):
+        expired_ids.extend(ids)
+
+    agg.on_expire = on_expire
+    await agg.ingest(record())
+    agg.get("j1").updated_at = time.time() - 100
+    assert await agg.expire_sweep() == ["j1"]
+    assert expired_ids == ["j1"]
+    assert agg.get_active("j1") is None
+
+
+@pytest.mark.asyncio
+async def test_historial_acotado(cfg):
+    cfg.history_limit = 10
+    agg = Aggregator(cfg)
+    for i in range(30):
+        await agg.ingest(record(f"j{i}"))
+    assert len(agg.history) == 10
+
+
+@pytest.mark.asyncio
+async def test_contadores_exactos(cfg):
+    agg = Aggregator(cfg)
+    await agg.ingest(record("a"))
+    await agg.ingest(record("b"))
+    await agg.ingest(record("a"))
+    assert agg.stats["findings"] == 2
+    assert agg.stats["servers_evaluated"] == 2
+
+
+@pytest.mark.asyncio
+async def test_snapshot_ordena_confirmados(cfg):
+    agg = Aggregator(cfg)
+    await agg.ingest(record("a"))
+    await agg.ingest(record("b", state=ServerState.CONFIRMED,
+                            verification=Verification.CONFIRMED, value=10**11))
+    assert agg.snapshot()[0]["job_id"] == "b"
+
+
+@pytest.mark.asyncio
+async def test_ui_stats_reflejan_estado(cfg):
+    agg = Aggregator(cfg)
+    await agg.ingest(record("a"))
+    stats = agg.ui_stats()
+    assert stats["candidates"] == 1
+    assert stats["confirmed"] == 0
+tests/test_notifier.py
+python
+import asyncio
+
+import pytest
+
+from notifier import Notifier
+
+
+class FakeWS:
+    def __init__(self):
+        self.sent = []
+        self.accepted = False
+
+    async def accept(self):
+        self.accepted = True
+
+    async def send_text(self, text):
+        self.sent.append(text)
+
+
+class SlowWS(FakeWS):
+    async def send_text(self, text):
+        await asyncio.sleep(5)
+        self.sent.append(text)
+
+
+class BrokenWS(FakeWS):
+    async def send_text(self, text):
+        raise RuntimeError("socket roto")
+
+
+@pytest.mark.asyncio
+async def test_broadcast():
+    notifier = Notifier()
+    ws = FakeWS()
+    await notifier.connect(ws)
+    notifier.publish("record", {"job_id": "x"})
+    await asyncio.sleep(0.05)
+    assert ws.accepted and len(ws.sent) == 1
+    await notifier.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_hello_dirigido():
+    notifier = Notifier()
+    first, second = FakeWS(), FakeWS()
+    await notifier.connect(first)
+    await notifier.connect(second)
+    await notifier.send_hello(second, {"paused": False})
+    await asyncio.sleep(0.05)
+    assert first.sent == [] and len(second.sent) == 1
+    await notifier.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_desconexion_limpia():
+    notifier = Notifier()
+    ws = FakeWS()
+    await notifier.connect(ws)
+    await notifier.disconnect(ws)
+    assert notifier.count == 0
+
+
+@pytest.mark.asyncio
+async def test_cliente_lento_no_bloquea():
+    notifier = Notifier()
+    slow, fast = SlowWS(), FakeWS()
+    await notifier.connect(slow)
+    await notifier.connect(fast)
+    for i in range(5):
+        notifier.publish("record", {"i": i})
+    await asyncio.sleep(0.1)
+    assert notifier.count == 2
+    assert len(fast.sent) == 5
+    await notifier.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_escritor_roto_no_rompe_el_hub():
+    notifier = Notifier()
+    broken, ok = BrokenWS(), FakeWS()
+    await notifier.connect(broken)
+    await notifier.connect(ok)
+    notifier.publish("record", {"i": 1})
+    await asyncio.sleep(0.1)
+    assert notifier.count == 1
+    await notifier.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cierre_limpio():
+    notifier = Notifier()
+    await notifier.connect(FakeWS())
+    await notifier.shutdown()
+    assert notifier.count == 0
+tests/test_bridge.py
+python
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+import bridge
+from aggregator import Aggregator
+from detection import Detector
+from notifier import Notifier
+
+JOB = "999dad42-3c76-4dcf-8b6f-298afcc35370"
+
+
+class Ctx:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.detector = Detector(cfg)
+        self.aggregator = Aggregator(cfg)
+        self.notifier = Notifier()
+
+
+@pytest.fixture
+def client(cfg):
+    cfg.place_id = 123
+    app = FastAPI()
+    app.include_router(bridge.build_router(Ctx(cfg)))
+    return TestClient(app), cfg
+
+
+def post(client, token, body):
+    return client.post("/api/bridge/report", json=body, headers={"X-Bridge-Token": token})
+
+
+def test_token_invalido(client):
+    c, _ = client
+    r = post(c, "malo", {"job_id": JOB, "place_id": 123, "eggs": [{"name": "X", "value": "10B"}]})
+    assert r.status_code == 401 and r.json()["error"]["code"] == "bad_token"
+
+
+def test_place_id_distinto(client):
+    c, cfg = client
+    r = post(c, cfg.bridge_token, {"job_id": JOB, "place_id": 999, "eggs": [{"name": "X", "value": "10B"}]})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "bad_place"
+
+
+def test_job_id_invalido(client):
+    c, cfg = client
+    r = post(c, cfg.bridge_token, {"job_id": "no-uuid", "place_id": 123,
+                                   "eggs": [{"name": "X", "value": "10B"}]})
+    assert r.status_code == 422
+
+
+def test_valor_bajo_umbral(client):
+    c, cfg = client
+    r = post(c, cfg.bridge_token, {"job_id": JOB, "place_id": 123,
+                                   "eggs": [{"name": "X", "value": "1B"}]})
+    assert r.status_code == 200 and r.json()["confirmed"] is False
+
+
+def test_valor_valido_confirma(client):
+    c, cfg = client
+    r = post(c, cfg.bridge_token, {"job_id": JOB, "place_id": 123,
+                                   "eggs": [{"name": "Divino", "value": "50B"}]})
+    assert r.status_code == 200 and r.json()["confirmed"] is True
+
+
+def test_sin_huevos_validos(client):
+    c, cfg = client
+    r = post(c, cfg.bridge_token, {"job_id": JOB, "place_id": 123,
+                                   "eggs": [{"name": "X", "value": "mucho"}]})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "no_valid_eggs"
+
+
+def test_puente_desactivado(client):
+    c, cfg = client
+    cfg.bridge_enabled = False
+    r = post(c, cfg.bridge_token, {"job_id": JOB, "place_id": 123,
+                                   "eggs": [{"name": "X", "value": "10B"}]})
+    assert r.status_code == 503
+
+
+def test_limite_de_frecuencia(client):
+    c, cfg = client
+    cfg.bridge_rate_per_min = 2
+    body = {"job_id": JOB, "place_id": 123, "eggs": [{"name": "X", "value": "10B"}]}
+    assert post(c, cfg.bridge_token, body).status_code == 200
+    assert post(c, cfg.bridge_token, body).status_code == 200
+    r = post(c, cfg.bridge_token, body)
+    assert r.status_code == 429 and r.json()["error"]["code"] == "rate_limited"
+tests/test_join.py
+python
+import join_handler
+
+JOB = "999dad42-3c76-4dcf-8b6f-298afcc35370"
+PLACE = 107778070777162
+
+
+def test_enlace_valido():
+    link = join_handler.build(JOB, PLACE, "joinable")
+    assert link["ok"] and link["joinable"]
+    assert "gameInstanceId=" + JOB in link["web"]
+
+
+def test_job_invalido():
+    assert join_handler.build("no-uuid", PLACE)["code"] == "bad_job"
+
+
+def test_place_invalido():
+    assert join_handler.build(JOB, 0)["code"] == "bad_place"
+
+
+def test_lleno_no_joinable():
+    link = join_handler.build(JOB, PLACE, "full")
+    assert link["ok"] and not link["joinable"] and link["reason"]
+
+
+def test_ocupacion_desconocida():
+    assert not join_handler.build(JOB, PLACE, "unknown")["joinable"]
+
+
+def test_open_protocolo_inexistente(monkeypatch):
+    def boom(_):
+        raise OSError("sin handler")
+
+    monkeypatch.setattr(join_handler.os, "startfile", boom, raising=False)
+    monkeypatch.setattr(join_handler.sys, "platform", "win32")
+    result = join_handler.open_protocol("roblox://placeId=1&gameInstanceId=x")
+    assert result["opened"] is False and result["reason"]
+tests/test_hop.py
+python
+import asyncio
+from decimal import Decimal
+
+import pytest
+
+from aggregator import Aggregator
+from detection import Detector
+from hop_controller import HopController, HopState
+from models import Egg, ServerRecord, ServerState
+from notifier import Notifier
+
+
+def make(cfg, monkeypatch, opened=True):
+    agg = Aggregator(cfg)
+    detector = Detector(cfg)
+    hop = HopController(cfg, agg, Notifier(), detector)
+    monkeypatch.setattr("hop_controller.open_protocol",
+                        lambda url: {"opened": opened, "reason": None if opened else "fallo"})
+    return hop, agg, detector
+
+
+def candidate(job_id="a", playing=3):
+    return ServerRecord(job_id=job_id, place_id=107778070777162,
+                        state=ServerState.CANDIDATE, playing=playing, max_players=7, score=10.0)
+
+
+@pytest.mark.asyncio
+async def test_estado_inicial(cfg, monkeypatch):
+    hop, _, _ = make(cfg, monkeypatch)
+    assert hop.state is HopState.IDLE and not hop.running
+
+
+@pytest.mark.asyncio
+async def test_no_repite_y_para(cfg, monkeypatch):
+    hop, agg, _ = make(cfg, monkeypatch)
+    cfg.hop_cooldown_s = 2
+    await agg.ingest(candidate())
+    hop.start()
+    await asyncio.sleep(0.2)
+    await hop.stop()
+    assert hop.tried == {"a"} and not hop.running and hop.state is HopState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_doble_start(cfg, monkeypatch):
+    hop, _, _ = make(cfg, monkeypatch)
+    hop.start()
+    assert hop.start()["ok"] is False
+    await hop.stop()
+
+
+@pytest.mark.asyncio
+async def test_exito_con_informe(cfg, monkeypatch):
+    hop, agg, detector = make(cfg, monkeypatch)
+    cfg.hop_cooldown_s = 2
+    await agg.ingest(candidate())
+    detector.register_report("a", [Egg("Divino", Decimal(10) ** 10)])
+    hop.start()
+    for _ in range(60):
+        await asyncio.sleep(0.05)
+        if hop.state is HopState.SUCCESS:
+            break
+    assert hop.state is HopState.SUCCESS
+    await hop.stop()
+
+
+@pytest.mark.asyncio
+async def test_apertura_fallida(cfg, monkeypatch):
+    hop, agg, _ = make(cfg, monkeypatch, opened=False)
+    await agg.ingest(candidate())
+    hop.start()
+    for _ in range(30):
+        await asyncio.sleep(0.05)
+        if hop.state is HopState.FAILED:
+            break
+    assert hop.state is HopState.FAILED and hop.last_reason
+    await hop.stop()
+
+
+@pytest.mark.asyncio
+async def test_selecciona_mejor_score(cfg, monkeypatch):
+    hop, agg, _ = make(cfg, monkeypatch)
+    low = candidate("bajo")
+    low.score = 1.0
+    high = candidate("alto")
+    high.score = 99.0
+    await agg.ingest(low)
+    await agg.ingest(high)
+    assert hop._select().job_id == "alto"
+tests/test_api.py
+python
+import pytest
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+from server import create_app
+
+JOB = "999dad42-3c76-4dcf-8b6f-298afcc35370"
+
+
+@pytest.fixture
+def client(cfg):
+    with TestClient(create_app(cfg, "127.0.0.1")) as c:
+        yield c
+
+
+def test_health(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+
+def test_state(client):
+    body = client.get("/api/state").json()
+    for key in ("paused", "workers", "stats", "config", "findings"):
+        assert key in body
+    assert "bridge_token" not in body["config"]
+
+
+def test_findings_vacio(client):
+    assert client.get("/api/findings").json() == {"findings": []}
+
+
+def test_findings_min_invalido(client):
+    r = client.get("/api/findings?min_value=mucho")
+    assert r.status_code == 422 and r.json()["error"]["code"] == "bad_min_value"
+
+
+def test_config_valida(client):
+    r = client.post("/api/config", json={"workers": 5, "min_value": "20B"})
+    assert r.status_code == 200 and r.json()["config"]["workers"] == 5
+
+
+def test_config_invalida(client):
+    r = client.post("/api/config", json={"workers": 500})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_config"
+
+
+def test_config_no_pierde_valores(client):
+    client.post("/api/config", json={"workers": 6})
+    client.post("/api/config", json={"workers": 900})
+    assert client.get("/api/state").json()["config"]["workers"] == 6
+
+
+def test_pausa_reanuda(client):
+    assert client.post("/api/pause").json()["paused"] is True
+    assert client.post("/api/resume").json()["paused"] is False
+
+
+def test_join_valido(client):
+    r = client.get(f"/api/join/{JOB}")
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+
+def test_join_invalido(client):
+    r = client.get("/api/join/no-uuid")
+    assert r.status_code == 422 and r.json()["error"]["code"] == "bad_job"
+
+
+def test_join_abre_sin_lanzar(client, monkeypatch):
+    monkeypatch.setattr("join_handler.open_protocol", lambda url: {"opened": True, "reason": None})
+    r = client.get(f"/api/join/{JOB}?launch=true")
+    assert r.json()["open_result"]["opened"] is True
+
+
+def test_clear(client):
+    assert client.post("/api/clear").status_code == 200
+
+
+def test_formato_error(client):
+    r = client.get("/api/join/no-uuid")
+    assert set(r.json()["error"]) == {"code", "message"}
+
+
+def test_escritura_requiere_token(cfg):
+    with TestClient(create_app(cfg, "0.0.0.0")) as c:
+        assert c.post("/api/pause").status_code == 401
+        assert c.post("/api/pause", headers={"X-Local-Token": cfg.bridge_token}).status_code == 200
+
+
+def test_join_requiere_token(cfg):
+    with TestClient(create_app(cfg, "0.0.0.0")) as c:
+        assert c.get(f"/api/join/{JOB}").status_code == 401
+
+
+def test_ws_saluda(client):
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["event"] == "hello"
+
+
+def test_ws_origin_rechazado(cfg):
+    with TestClient(create_app(cfg, "0.0.0.0")) as c:
+        with pytest.raises(WebSocketDisconnect):
+            with c.websocket_connect("/ws", headers={"origin": "http://malo.example"}) as ws:
+                ws.receive_json()
+
+
+def test_ws_origin_local_aceptado(cfg):
+    with TestClient(create_app(cfg, "0.0.0.0")) as c:
+        with c.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8710"}) as ws:
+            assert ws.receive_json()["event"] == "hello"
+tests/test_cli.py
+python
+import pytest
+
+import main
+from config import Config
+
+
+def preparar(tmp_path, monkeypatch):
+    import config as config_module
+    monkeypatch.setattr(config_module, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(main, "create_app", lambda cfg, host: cfg)
+    monkeypatch.setattr(main.uvicorn, "run", lambda app, **kw: None)
+
+
+def test_workers_cero_se_ajusta(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch)
+    assert main.main(["--workers", "0"]) == 0
+    assert Config.load(tmp_path / "config.json").workers == 1
+
+
+def test_workers_muy_alto_se_ajusta(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch)
+    assert main.main(["--workers", "999"]) == 0
+    assert Config.load(tmp_path / "config.json").workers == 100
+
+
+def test_puerto_invalido(monkeypatch):
+    with pytest.raises(SystemExit):
+        main.main(["--port", "70000"])
+
+
+def test_host_invalido(monkeypatch):
+    with pytest.raises(SystemExit):
+        main.main(["--host", "no.existe.local"])
+
+
+def test_min_value_invalido(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit):
+        main.main(["--min-value", "mucho"])
+tests/test_ui_contract.py
+python
+from pathlib import Path
+
+UI = Path(__file__).resolve().parents[1] / "ui"
+
+
+def test_sin_innerhtml():
+    code = (UI / "app.js").read_text(encoding="utf-8")
+    assert "textContent" in code
+    assert "innerHTML" not in code
+
+
+def test_formulario_separado():
+    assert "formDirty" in (UI / "app.js").read_text(encoding="utf-8")
+
+
+def test_audio_con_dedupe_y_resume():
+    code = (UI / "app.js").read_text(encoding="utf-8")
+    assert "lastBeep" in code and "resume" in code
+
+
+def test_token_en_cabecera():
+    assert "X-Local-Token" in (UI / "app.js").read_text(encoding="utf-8")
+
+
+def test_ids_coinciden():
+    html = (UI / "index.html").read_text(encoding="utf-8")
+    code = (UI / "app.js").read_text(encoding="utf-8")
+    for element_id in ["m-join", "m-copy", "m-web", "m-close", "cfg-min", "stats", "cfg-token"]:
+        assert element_id in html
+        assert element_id in code
+
+
+def test_usa_ws_segun_protocolo():
+    assert "wss://" in (UI / "app.js").read_text(encoding="utf-8")
+F. LIMITACIONES
+Función	Depende de
+Descubrir instancias	API pública de Roblox; ventana de ~700 por orden, límite por IP
+Puntuar candidatos	Datos ping/fps/playing que Roblox devuelva (pueden faltar)
+Confirmar huevos	Puente Lua dentro del juego; sin él solo hay candidatos
+Nombres y valores de huevos	Heurística sobre BillboardGui; se rompe si el juego cambia su estructura
+Entrada a la instancia	Roblox Player instalado + protocolo registrado + slot libre
+Servidores VIP	Cookie .ROBLOSECURITY, no implementada
+Cobertura total	Imposible con la API pública
+Nada de esto se presenta como garantía en la UI: el modal dice explícitamente que un candidato no tiene datos de contenido y que abrir Roblox no confirma la entrada.
+
+G. LISTA DE VERIFICACIÓN
+ Todos los archivos necesarios presentes (21 archivos + 15 de test)
+ Importaciones revisadas una por una; sin referencias huérfanas
+ Dependencias declaradas con versión fija
+ Interfaces entre módulos coinciden (aggregator.confirm devuelve ServerRecord, notifier.publish es síncrono y usado así en todos los sitios, limiter.release es async en los 3 puntos de llamada)
+ Formato de error único {"error":{"code","message"}} en servidor y puente
+ Operaciones sensibles con Depends(auth), incluido GET /api/join y WS con Origin
+ Tareas asíncronas: stop() con cancel + gather, watchdog con referencia única, gate liberado en cancelación
+ La UI usa value_tier y verification, no inventa valores
+ open_result separado de "unido"
+ Pruebas entregadas; no ejecutadas (sin intérprete en esta sesión)
+ Sin capacidades inventadas de Roblox
+ Sin secretos reales; token autogenerado con secrets.token_urlsafe
+ Instalación completa para Windows 11
+Pendiente y declarado: ejecución real de pytest, verificación en vivo del puente Lua (requiere Roblox + ejecutor) y revisión visual del responsive.
