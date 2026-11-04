@@ -1,0 +1,14 @@
+{
+  "name": "sae-live-radar-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Central event relay for SAE Live Radar",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test:spawn": "node test-send.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
