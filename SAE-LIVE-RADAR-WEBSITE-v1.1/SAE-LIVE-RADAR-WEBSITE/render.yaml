@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: sae-live-radar-website
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: PRODUCT_VERSION
+        value: 0.2.0

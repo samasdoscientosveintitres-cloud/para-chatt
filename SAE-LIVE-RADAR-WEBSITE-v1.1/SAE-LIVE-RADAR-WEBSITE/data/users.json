@@ -1,0 +1,12 @@
+{
+  "users": [
+    {
+      "id": "4be444c4-b635-4d81-95db-047aa94c76de",
+      "email": "samasdoscientosveintitres@gmail.com",
+      "passwordHash": "scrypt$06e18fbef949f6ac139764b4c479f737$b6f03f572b0470afba0d13eb88f1625cf644bd2752882dfd3664ce93e41208da6ae4aa3163c84ff2a79655b89d3dbd2ba089c382d4f04abe5dc80137712ffdf4",
+      "hasAccess": false,
+      "purchasedAt": null,
+      "createdAt": "2026-11-04T03:38:28.083Z"
+    }
+  ]
+}
