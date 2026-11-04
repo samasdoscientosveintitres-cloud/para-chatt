@@ -1,0 +1,2033 @@
+require('dotenv').config();
+const fs = require('node:fs');
+const path = require('node:path');
+const cron = require('node-cron');
+const { DateTime } = require('luxon');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  Events,
+  ActivityType,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  RoleSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ChannelType,
+  MessageFlags,
+  PermissionFlagsBits
+} = require('discord.js');
+const config = require('./config.json');
+// CONFIGURACIÓN
+const TOKEN = process.env.DISCORD_TOKEN;
+const CHANNEL_ID = process.env.PREDICTION_CHANNEL_ID;
+const SENZ_CHANNEL_ID = '1546326086575726662';
+const NEXT_EVENT_CHANNEL_ID = process.env.NEXT_EVENT_CHANNEL_ID;
+const SENZ_PING_CHANNEL_ID = '1546328271686471770';
+const SENZ_PING_ROLE_IDS = new Set([
+  '1546660494331482195',
+  '1546660615203065867',
+  '1546660684090052659'
+]);
+const PREDICTION_ROLE_ID = '1561471483748819117';
+const TIMEZONE = process.env.TIMEZONE || 'America/New_York';
+const PREDICTION_HOUR = Number(process.env.PREDICTION_HOUR || 13);
+const PREDICTION_MINUTE = Number(process.env.PREDICTION_MINUTE || 30);
+const OWNER_ROLE_IDS = new Set([
+  '1546327781808537600',
+  '1556820095156887562'
+]);
+const EVERYONE_EXEMPT_ROLE_IDS = new Set([
+  '1546327781808537600', // Madaf4kin Owner
+  '1556820095156887562', // Madaf4kin Ownaa
+  '1561794747901681774'  // Secondary Own
+]);
+// BOT GUARDIAN: permisos y documentación
+const GUARDIAN_ADMIN_ROLE_IDS = new Set([
+  '1546327781808537600',
+  '1556820095156887562',
+  '1561794747901681774'
+]);
+const GUARDIAN_WARN_EXTRA_ROLE_IDS = new Set([
+  '1550293700637233262',
+  '1548903507502047312'
+]);
+const GUARDIAN_HERE_EXEMPT_ROLE_IDS = GUARDIAN_ADMIN_ROLE_IDS;
+const GUARDIAN_DOCUMENTATION_CHANNEL_ID = '1549588388011835473';
+const GUARDIAN_GUILD_ID = process.env.GUARDIAN_GUILD_ID || '';
+const GUARDIAN_DATA_FILE = path.join(__dirname, 'data', 'guardian-warnings.json');
+const DIVINE_PAGE_SIZE = 25;
+const SENZ_DIVINE_NAMES = [
+  'Kitsune',
+  'World Burner',
+  'Nightflame',
+  'Unicorn',
+  'Royal Skywhale',
+  'ArchAngel'
+];
+const DIVINE_REACTION_EMOJIS = [
+  '<:Unicornio:1546316714432794774>',
+  '<:Kitsune:1546316654634471484>',
+  '<:NightFlame:1546316561101361242>',
+  '<:ArchAngel:1549585015816323092>',
+  '<:WorldBurner:1549545829977821264>',
+  '<:SkyWhale:1557192169809510400>'
+];
+if (!TOKEN) {
+  throw new Error('Falta DISCORD_TOKEN en el archivo .env');
+}
+if (!CHANNEL_ID) {
+  throw new Error('Falta PREDICTION_CHANNEL_ID en el archivo .env');
+}
+if (!Array.isArray(config.divines) || config.divines.length < 5) {
+  throw new Error('config.json debe tener al menos 5 elementos en "divines".');
+}
+if (!config.prediction) {
+  throw new Error('Falta la configuración "prediction" en config.json.');
+}
+// ALMACENAMIENTO
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'state.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const defaultState = {
+  lastPublishedLocalDate: null,
+  predictionMessageId: null,
+  predictionChannelId: CHANNEL_ID,
+  currentPrediction: [],
+  chanceState: {},
+  antiEveryone: {}
+};
+function loadState() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      return structuredClone(defaultState);
+    }
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    return {
+      ...structuredClone(defaultState),
+      ...parsed,
+      chanceState: {
+        ...(parsed.chanceState || {})
+      },
+      antiEveryone: {
+        ...(parsed.antiEveryone || {})
+      }
+    };
+  } catch (error) {
+    console.error('No se pudo leer data/state.json:', error);
+    return structuredClone(defaultState);
+  }
+}
+let state = loadState();
+function saveState() {
+  const temp = DATA_FILE + '.tmp';
+  fs.writeFileSync(temp, JSON.stringify(state, null, 2));
+  fs.renameSync(temp, DATA_FILE);
+}
+// UTILIDADES
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+function normalizeName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+function findDivine(input) {
+  const normalized = normalizeName(input);
+  if (!normalized) return null;
+  return config.divines.find(divine => {
+    const names = [
+      divine.key,
+      divine.name,
+      divine.display,
+      ...(divine.aliases || [])
+    ];
+    return names.some(name => {
+      const candidate = normalizeName(name);
+      return candidate && (
+        candidate === normalized ||
+        candidate.includes(normalized) ||
+        normalized.includes(candidate)
+      );
+    });
+  }) || null;
+}
+function getDivineDisplay(divine) {
+  return divine.display || divine.name || divine.key;
+}
+function buildUtcTimestamp(dateTime) {
+  return Math.floor(dateTime.toUTC().toSeconds());
+}
+async function addDivineReactions(message) {
+  for (const emoji of DIVINE_REACTION_EMOJIS) {
+    try {
+      await message.react(emoji);
+    } catch (error) {
+      console.error(
+        `No pude añadir la reacción ${emoji} a la predicción:`,
+        error.message
+      );
+    }
+  }
+}
+// PERMISOS DE OWNER
+function hasOwnerRole(member) {
+  return Boolean(
+    member?.roles?.cache?.some(role =>
+      OWNER_ROLE_IDS.has(role.id)
+    )
+  );
+}
+async function ensureOwner(interaction) {
+  if (!interaction.guild) {
+    await interaction.reply({
+      content: '❌ Este comando solo se puede usar en un servidor.',
+      ephemeral: true
+    });
+    return false;
+  }
+  let member = interaction.guild.members.cache.get(
+    interaction.user.id
+  );
+  if (!member) {
+    member = await interaction.guild.members
+      .fetch(interaction.user.id)
+      .catch(() => null);
+  }
+  if (!hasOwnerRole(member)) {
+    const payload = {
+      content:
+        '⛔ No tenés permiso. Solo los roles Madaf4kin Owner y Madaf4kin Ownaa pueden utilizar esta función.',
+      ephemeral: true
+    };
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp(payload).catch(() => {});
+    } else {
+      await interaction.reply(payload).catch(() => {});
+    }
+    return false;
+  }
+  return true;
+}
+// LECTURA DE SENZ V2
+async function getSenzLastSeen(client) {
+  const channel = await client.channels.fetch(SENZ_CHANNEL_ID);
+  if (!channel || !channel.isTextBased() || !channel.messages) {
+    throw new Error('No puedo acceder al canal de SenZ V2.');
+  }
+  const messages = await channel.messages.fetch({ limit: 100 });
+  function extractText(components) {
+    const parts = [];
+    for (const component of components || []) {
+      if (typeof component.content === 'string') {
+        parts.push(component.content);
+      }
+      if (Array.isArray(component.components)) {
+        parts.push(extractText(component.components));
+      }
+    }
+    return parts.join('\n');
+  }
+  const candidates = [...messages.values()]
+    .map(message => {
+      const content = [
+        message.content || '',
+        ...message.embeds.map(embed => [
+          embed.title || '',
+          embed.description || '',
+          ...(embed.fields || []).flatMap(field => [
+            field.name || '',
+            field.value || ''
+          ])
+        ].join('\n')),
+        extractText(message.components)
+      ].join('\n');
+      return { message, content };
+    })
+    .filter(item =>
+      /Divine\s*[-—–]\s*Last\s*Seen/i.test(item.content)
+    )
+    .sort(
+      (a, b) =>
+        b.message.createdTimestamp - a.message.createdTimestamp
+    );
+  if (candidates.length === 0) {
+    throw new Error(
+      'No encontré Divine — Last Seen en los últimos 100 mensajes accesibles de SenZ.'
+    );
+  }
+  for (const candidate of candidates) {
+    const content = candidate.content;
+    const headerRegex = /###\s*.*?Divine\s*[-—–]\s*Last\s*Seen/i;
+    const headerMatch = headerRegex.exec(content);
+    if (!headerMatch) continue;
+    const afterHeader = content.slice(
+      headerMatch.index + headerMatch[0].length
+    );
+    const nextSection = /\n\s*#{1,6}\s+/g.exec(afterHeader);
+    const divineSection = nextSection
+      ? afterHeader.slice(0, nextSection.index)
+      : afterHeader;
+    const result = new Map();
+    const lineRegex =
+      /^\s*.*?([A-Za-z][A-Za-z ]*?)\s*[—–-]\s*<t:(\d+):[tTdDfFR]>\s*$/gm;
+    for (const match of divineSection.matchAll(lineRegex)) {
+      const name = match[1].trim();
+      const timestamp = Number(match[2]);
+      const normalized = normalizeName(name);
+      const canonical = SENZ_DIVINE_NAMES.find(
+        item => normalizeName(item) === normalized
+      );
+      if (
+        canonical &&
+        Number.isSafeInteger(timestamp) &&
+        timestamp > 0
+      ) {
+        result.set(canonical, timestamp);
+      }
+    }
+    const missing = SENZ_DIVINE_NAMES.filter(
+      name => !result.has(name)
+    );
+    if (missing.length === 0) {
+      return result;
+    }
+  }
+  throw new Error(
+    'No se encontraron todos los Divines en los componentes de SenZ. ' +
+    'Faltan: ' + SENZ_DIVINE_NAMES.filter(name => {
+      return !candidates.some(candidate => {
+        const text = candidate.content;
+        return text.includes(name);
+      });
+    }).join(', ') +
+    '. No se publicó la predicción.'
+  );
+}
+// PROBABILIDADES SEGÚN EL TIEMPO DESDE LA ÚLTIMA APARICIÓN
+function calculateSenzChance(divineName, lastSeenTimestamp) {
+  const elapsedSeconds = Math.max(
+    0,
+    Math.floor(Date.now() / 1000) - lastSeenTimestamp
+  );
+  const elapsedDays = elapsedSeconds / 86400;
+  const name = normalizeName(divineName);
+  const specialDivines = [
+    'nightflame',
+    'kitsune',
+    'unicorn'
+  ];
+  const isSpecial = specialDivines.includes(name);
+  if (elapsedDays < 1) return 11;
+  if (elapsedDays < 2) return 20;
+  if (elapsedDays < 3) return 25;
+  if (elapsedDays < 4) {
+    return name === 'kitsune' || name === 'unicorn'
+      ? 40
+      : 35;
+  }
+  if (elapsedDays < 5) {
+    return isSpecial ? 50 : 48;
+  }
+  if (!isSpecial) {
+    return 48;
+  }
+  const extraDays = Math.floor(elapsedDays) - 5;
+  return Math.min(89, 60 + extraDays * 5);
+}
+function getSenzDivineObjects() {
+  return SENZ_DIVINE_NAMES.map(senzName => {
+    const divine = config.divines.find(item => {
+      const names = [
+        item.key,
+        item.name,
+        item.display,
+        ...(item.aliases || [])
+      ].filter(Boolean);
+      return names.some(name =>
+        normalizeName(name) === normalizeName(senzName)
+      );
+    });
+    if (!divine) {
+      throw new Error(
+        `No encontré "${senzName}" en config.json. Revisá su nombre o aliases.`
+      );
+    }
+    return divine;
+  });
+}
+function getSenzDivineChance(divine, lastSeenData) {
+  const possibleNames = [
+    divine.key,
+    divine.name,
+    divine.display,
+    ...(divine.aliases || [])
+  ].filter(Boolean);
+  const matchingName = SENZ_DIVINE_NAMES.find(senzName =>
+    possibleNames.some(name =>
+      normalizeName(name) === normalizeName(senzName)
+    )
+  );
+  if (!matchingName || !lastSeenData.has(matchingName)) {
+    throw new Error(
+      `No hay datos válidos de SenZ para ${getDivineDisplay(divine)}.`
+    );
+  }
+  return calculateSenzChance(
+    matchingName,
+    lastSeenData.get(matchingName)
+  );
+}
+// HORARIOS DE LAS PREDICCIONES AUTOMÁTICAS
+function randomPredictionTimes() {
+  const now = DateTime.now().setZone(TIMEZONE);
+  let lower = now.plus({
+    hours: config.prediction.scheduleMinHoursAhead || 0
+  });
+  if (lower <= now) {
+    lower = now.plus({ minutes: 1 });
+  }
+  lower = lower
+    .set({ second: 0, millisecond: 0 })
+    .plus({ minutes: (5 - (lower.minute % 5)) % 5 });
+  if (lower <= now) {
+    lower = lower.plus({ minutes: 5 });
+  }
+  const endOfDay = now.endOf('day');
+  const available = [];
+  for (
+    let candidate = lower;
+    candidate <= endOfDay;
+    candidate = candidate.plus({ minutes: 5 })
+  ) {
+    if (candidate > now) {
+      available.push(candidate);
+    }
+  }
+  if (available.length < 5) {
+    throw new Error(
+      'No hay suficientes horarios de 5 minutos disponibles para hoy.'
+    );
+  }
+  const chosen = [];
+  while (chosen.length < 5) {
+    const index = randInt(0, available.length - 1);
+    chosen.push(available.splice(index, 1)[0]);
+  }
+  return chosen.sort((a, b) => a.toMillis() - b.toMillis());
+}
+function randomFiveDivines() {
+  const available = getSenzDivineObjects();
+  const selected = [];
+  while (selected.length < 5) {
+    const index = randInt(0, available.length - 1);
+    selected.push(available.splice(index, 1)[0]);
+  }
+  return selected;
+}
+// EMBED DE LA PREDICCIÓN AUTOMÁTICA
+function getPredictionLines(prediction) {
+  return prediction
+    .slice()
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map(item => {
+      const divine = findDivine(item.key);
+      if (!divine) {
+        return `**${item.key}** · ${item.chance}% · <t:${item.timestamp}:R>`;
+      }
+      const display = getDivineDisplay(divine);
+      const zone = divine.zone
+        ? ` · ${divine.zoneEmoji ? divine.zoneEmoji + ' ' : ''}${divine.zone}`
+        : '';
+      return `${display}${zone} · **${item.chance}%** · <t:${item.timestamp}:R>`;
+    });
+}
+function buildEmbed(prediction) {
+  return new EmbedBuilder()
+    .setColor(0x7C3AED)
+    .setTitle(config.prediction.title || '🥚 SAE PREDICTION')
+    .setDescription([
+      config.prediction.header || '**Predicciones de hoy:**',
+      '',
+      ...getPredictionLines(prediction)
+    ].join('\n'))
+    .setFooter({
+      text: 'SAE PREDICTION · Las predicciones pueden fallar.'
+    })
+    .setTimestamp(new Date());
+}
+// ==========================================================// PUMPKIN KING EVENT// ==========================================================
+// UFO EVENT
+async function publishUFOEvent(client) {
+  try {
+    console.log('Intentando enviar UFO EVENT...');
+
+    const channel = await client.channels.fetch(NEXT_EVENT_CHANNEL_ID);
+
+    if (!channel || !channel.isTextBased()) {
+      throw new Error('NEXT_EVENT_CHANNEL_ID no apunta a un canal de texto válido.');
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('🛸 OVNI EVENT IS NOW ACTIVE!')
+      .setDescription(
+        '<:Roblox:1564309702085443744> **Únete al juego:** [Click Here](https://www.roblox.com/games/107778070777162/Steal-An-Egg)'
+      )
+      .setTimestamp();
+
+    await channel.send({
+      content: '<@&1556402418911289415>',
+      embeds: [embed],
+      allowedMentions: {
+        roles: ['1556402418911289415']
+      }
+    });
+
+    console.log('UFO EVENT enviado correctamente.');
+    return true;
+
+  } catch (error) {
+    console.error('Error enviando UFO EVENT:', error);
+    return false;
+  }
+}
+// PUBLICAR PREDICCIÓN AUTOMÁTICA
+async function publishDailyPrediction(client, options = {}) {
+  const now = DateTime.now().setZone(TIMEZONE);
+  const localDate = now.toISODate();
+  if (
+    !options.force &&
+    state.lastPublishedLocalDate === localDate
+  ) {
+    return;
+  }
+  const lastSeenData = await getSenzLastSeen(client);
+  const times = randomPredictionTimes();
+  const selectedDivines = randomFiveDivines();
+  const prediction = selectedDivines
+    .map((divine, index) => ({
+      key: divine.key,
+      timestamp: buildUtcTimestamp(times[index]),
+      chance: getSenzDivineChance(divine, lastSeenData)
+    }))
+    .sort((a, b) => a.timestamp - b.timestamp);
+  const channel = await client.channels.fetch(CHANNEL_ID);
+  if (!channel || !channel.isTextBased()) {
+    throw new Error(
+      'PREDICTION_CHANNEL_ID no apunta a un canal de texto.'
+    );
+  }
+  const message = await channel.send({
+    content: `<@&${PREDICTION_ROLE_ID}>`,
+    embeds: [buildEmbed(prediction)],
+    allowedMentions: {
+      parse: [],
+      roles: [PREDICTION_ROLE_ID]
+    }
+  });
+  await addDivineReactions(message);
+  state.lastPublishedLocalDate = localDate;
+  state.predictionMessageId = message.id;
+  state.predictionChannelId = CHANNEL_ID;
+  state.currentPrediction = prediction;
+  saveState();
+  console.log('Predicción diaria publicada:', message.url);
+}
+// PARSEO PARA EDITAR PREDICCIONES EXISTENTES
+function parseTime(content) {
+  const cleaned = content.toLowerCase();
+  const match = cleaned.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+  const now = DateTime.now().setZone(TIMEZONE);
+  let date = now.startOf('day');
+  if (/\bpasado\s+manana\b|\bpasado\s+mañana\b/.test(cleaned)) {
+    date = date.plus({ days: 2 });
+  } else if (/\bmanana\b|\bmañana\b/.test(cleaned)) {
+    date = date.plus({ days: 1 });
+  } else {
+    const dateMatch = cleaned.match(
+      /\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/
+    );
+    if (dateMatch) {
+      let year = dateMatch[3]
+        ? Number(dateMatch[3])
+        : now.year;
+      if (year < 100) year += 2000;
+      date = DateTime.fromObject({
+        year,
+        month: Number(dateMatch[2]),
+        day: Number(dateMatch[1])
+      }, {
+        zone: TIMEZONE
+      }).startOf('day');
+      if (!date.isValid) return null;
+    } else {
+      const candidate = date.set({
+        hour,
+        minute,
+        second: 0,
+        millisecond: 0
+      });
+      return candidate > now
+        ? candidate
+        : candidate.plus({ days: 1 });
+    }
+  }
+  return date.set({
+    hour,
+    minute,
+    second: 0,
+    millisecond: 0
+  });
+}
+function parseChance(content) {
+  const match = content.match(/(?:^|\s)(\d{1,3})\s*%/i);
+  if (!match) return null;
+  const chance = Number(match[1]);
+  return chance >= 0 && chance <= 89
+    ? chance
+    : null;
+}
+// EDITAR LA PREDICCIÓN AUTOMÁTICA ACTUAL
+async function editCurrentPrediction(
+  client,
+  divine,
+  newTime,
+  newChance
+) {
+  const now = DateTime.now().setZone(TIMEZONE);
+  const diffHours = newTime.diff(now, 'hours').hours;
+  if (
+    !state.predictionMessageId ||
+    diffHours < 0 ||
+    diffHours > 72
+  ) {
+    return false;
+  }
+  const channel = await client.channels.fetch(
+    state.predictionChannelId || CHANNEL_ID
+  );
+  if (!channel || !channel.isTextBased()) return false;
+  const message = await channel.messages.fetch(
+    state.predictionMessageId
+  );
+  const current = (state.currentPrediction || [])
+    .map(item => ({ ...item }));
+  const target = current.find(
+    item => normalizeName(item.key) === normalizeName(divine.key)
+  );
+  if (!target) return false;
+  target.timestamp = buildUtcTimestamp(newTime);
+  if (newChance !== null) {
+    target.chance = newChance;
+  }
+  current.sort((a, b) => a.timestamp - b.timestamp);
+  state.currentPrediction = current;
+  saveState();
+  await message.edit({
+    embeds: [buildEmbed(current)]
+  });
+  return true;
+}
+// COMANDO /ADDPREDICTION
+function buildDivineSelectRows(userId, page = 0) {
+  const totalPages = Math.ceil(
+    config.divines.length / DIVINE_PAGE_SIZE
+  );
+  const start = page * DIVINE_PAGE_SIZE;
+  const divines = config.divines.slice(
+    start,
+    start + DIVINE_PAGE_SIZE
+  );
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`addprediction_divine:${userId}:${page}`)
+    .setPlaceholder('¿Qué personaje querés predecir?')
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      divines.map(divine => ({
+        label: String(
+          divine.name || divine.display || divine.key
+        ).slice(0, 100),
+        value: String(divine.key).slice(0, 100),
+        description: String(divine.zone || 'Divine').slice(0, 100)
+      }))
+    );
+  const rows = [
+    new ActionRowBuilder().addComponents(select)
+  ];
+  if (totalPages > 1) {
+    const buttons = [];
+    if (page > 0) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`addprediction_page:${userId}:${page - 1}`)
+          .setLabel('Anterior')
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+    if (page < totalPages - 1) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`addprediction_page:${userId}:${page + 1}`)
+          .setLabel('Siguiente')
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+    rows.push(new ActionRowBuilder().addComponents(buttons));
+  }
+  return rows;
+}
+function parseUpcomingClockTime(value) {
+  const match = String(value || '')
+    .trim()
+    .match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const now = DateTime.now().setZone(TIMEZONE);
+  let candidate = now.set({
+    hour,
+    minute,
+    second: 0,
+    millisecond: 0
+  });
+  if (candidate <= now) {
+    candidate = candidate.plus({ days: 1 });
+  }
+  return candidate;
+}
+function buildManualPredictionEmbed(
+  divine,
+  firstTime,
+  secondTime,
+  chance
+) {
+  const firstTimestamp = buildUtcTimestamp(firstTime);
+  const secondTimestamp = buildUtcTimestamp(secondTime);
+  const display = getDivineDisplay(divine);
+  return new EmbedBuilder()
+    .setColor(0x7C3AED)
+    .setTitle(`DIVINE PREDICTION: ${chance}%`)
+    .setDescription(
+      `# ${display}\n` +
+      `<t:${firstTimestamp}:R> ~ <t:${secondTimestamp}:R>`
+    )
+    .setFooter({
+      text: 'SAE PREDICTION · Las predicciones pueden fallar.'
+    })
+    .setTimestamp(new Date());
+}
+// BOT GUARDIAN: persistencia de advertencias
+if (!fs.existsSync(path.dirname(GUARDIAN_DATA_FILE))) {
+  fs.mkdirSync(path.dirname(GUARDIAN_DATA_FILE), { recursive: true });
+}
+if (!fs.existsSync(GUARDIAN_DATA_FILE)) {
+  fs.writeFileSync(GUARDIAN_DATA_FILE, JSON.stringify({ guilds: {} }, null, 2));
+}
+function loadGuardianWarnings() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(GUARDIAN_DATA_FILE, 'utf8'));
+    return parsed && parsed.guilds ? parsed : { guilds: {} };
+  } catch (error) {
+    console.error('BOT GUARDIAN: no se pudo leer el historial de warns:', error);
+    return { guilds: {} };
+  }
+}
+let guardianWarnings = loadGuardianWarnings();
+function saveGuardianWarnings() {
+  const temporary = `${GUARDIAN_DATA_FILE}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(guardianWarnings, null, 2));
+  fs.renameSync(temporary, GUARDIAN_DATA_FILE);
+}
+function getGuardianUserRecord(guildId, userId) {
+  if (!guardianWarnings.guilds[guildId]) guardianWarnings.guilds[guildId] = {};
+  if (!guardianWarnings.guilds[guildId][userId]) guardianWarnings.guilds[guildId][userId] = [];
+  return guardianWarnings.guilds[guildId][userId];
+}
+function memberHasOneOf(member, roleIds) {
+  return Boolean(member?.roles?.cache && [...roleIds].some(id => member.roles.cache.has(id)));
+}
+function guardianCanAdmin(member) {
+  return memberHasOneOf(member, GUARDIAN_ADMIN_ROLE_IDS);
+}
+function guardianCanWarn(member) {
+  return guardianCanAdmin(member) || memberHasOneOf(member, GUARDIAN_WARN_EXTRA_ROLE_IDS);
+}
+async function guardianLog(guild, user, reason, total, sanction) {
+  try {
+    const channel = await guild.channels.fetch(GUARDIAN_DOCUMENTATION_CHANNEL_ID);
+    if (!channel?.isTextBased() || !channel.isSendable()) {
+      console.error('BOT GUARDIAN: el canal de documentación no está disponible.');
+      return;
+    }
+    const embed = new EmbedBuilder()
+      .setColor(0x475569)
+      .setTitle('Registro de moderación')
+      .setDescription(
+        `Usuario: ${user.tag} (${user.id})\n` +
+        `Infracción: ${reason}\n` +
+        `Total de advertencias: ${total}\n` +
+        `Sanción: ${sanction}`
+      )
+      .setTimestamp(new Date());
+    await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  } catch (error) {
+    console.error('BOT GUARDIAN: no se pudo registrar el suceso:', error.message);
+  }
+}
+async function guardianAddWarning(guild, user, reason, source = 'manual') {
+  const warnings = getGuardianUserRecord(guild.id, user.id);
+  warnings.push({ reason, source, createdAt: new Date().toISOString() });
+  const total = warnings.length;
+  let duration = 0;
+  let durationLabel = 'Sin timeout automático';
+  if (total >= 30) {
+    duration = 24 * 60 * 60 * 1000;
+    durationLabel = '24 horas';
+  } else if (total >= 6) {
+    duration = 60 * 60 * 1000;
+    durationLabel = '1 hora';
+  } else if (total === 5) {
+    duration = 10 * 60 * 1000;
+    durationLabel = '10 minutos';
+  } else if (total === 3) {
+    duration = 60 * 1000;
+    durationLabel = '1 minuto';
+  }
+  let sanction = 'Advertencia registrada.';
+  if (duration > 0) {
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (member?.moderatable) {
+      try {
+        await member.timeout(duration, `BOT GUARDIAN: ${reason}`);
+        sanction = `Timeout de ${durationLabel}.`;
+      } catch (error) {
+        sanction = `No se pudo aplicar timeout de ${durationLabel}: ${error.message}`;
+      }
+    } else {
+      sanction = `Advertencia registrada; no se pudo aplicar timeout de ${durationLabel} por permisos o jerarquía de roles.`;
+    }
+  }
+  saveGuardianWarnings();
+  await guardianLog(guild, user, reason, total, sanction);
+  return { total, sanction };
+}
+async function guardianSendDm(user, text) {
+  try {
+    await user.send(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function guardianIsAllowedGuild(interaction) {
+  return Boolean(GUARDIAN_GUILD_ID && interaction.guildId === GUARDIAN_GUILD_ID);
+}
+// REGISTRAR COMANDOS
+async function registerSlashCommands(readyClient) {
+  try {
+    const commands = [
+      new SlashCommandBuilder()
+        .setName('addprediction')
+        .setDescription('Crear una predicción manual para un Divine'),
+      new SlashCommandBuilder()
+        .setName('warn')
+        .setDescription('Registrar una advertencia de moderación')
+        .addUserOption(option => option.setName('usuario').setDescription('Usuario que recibirá la advertencia').setRequired(true))
+        .addStringOption(option => option.setName('motivo').setDescription('Motivo de la advertencia').setRequired(true).setMaxLength(500)),
+      new SlashCommandBuilder()
+        .setName('documentacion')
+        .setDescription('Consultar las advertencias de un usuario')
+        .addUserOption(option => option.setName('usuario').setDescription('Usuario que se desea consultar').setRequired(true)),
+      new SlashCommandBuilder()
+        .setName('sendmessage')
+        .setDescription('Enviar un mensaje a un canal')
+        .addStringOption(option => option.setName('contenido').setDescription('Contenido del mensaje').setRequired(true).setMaxLength(2000))
+        .addChannelOption(option => option.setName('canal').setDescription('Canal de destino').addChannelTypes(ChannelType.GuildText).setRequired(false))
+        .addUserOption(option => option.setName('mencionar').setDescription('Usuario a mencionar (opcional)').setRequired(false))
+        .addAttachmentOption(option => option.setName('archivo').setDescription('Archivo adjunto opcional').setRequired(false)),
+      new SlashCommandBuilder()
+        .setName('embed')
+        .setDescription('Crear y publicar un embed personalizado')
+        .addChannelOption(option => option
+          .setName('canal')
+          .setDescription('Canal donde se publicará el embed')
+          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          .setRequired(true))
+    ].map(command => command.toJSON());
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+    for (const guild of readyClient.guilds.cache.values()) {
+      await rest.put(
+        Routes.applicationGuildCommands(
+          readyClient.user.id,
+          guild.id
+        ),
+        { body: commands }
+      );
+      console.log(
+        `✅ Comando /addprediction registrado en ${guild.name}`
+      );
+    }
+  } catch (error) {
+    console.error('❌ Error registrando comandos slash:', error);
+  }
+}
+// BORRADORES TEMPORALES DEL CONSTRUCTOR DE EMBEDS
+// Se guardan entre los dos formularios mientras el proceso del bot siga activo.
+const embedDrafts = new Map();
+function isValidHttpUrl(value) {
+  if (!value) return true;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+const EMBED_COLOR_NAMES = {
+  morado: 0x7C3AED,
+  violeta: 0x8B5CF6,
+  purpura: 0x7C3AED,
+  rojo: 0xE53935,
+  azul: 0x1E88E5,
+  'azul oscuro': 0x0D47A1,
+  celeste: 0x29B6F6,
+  verde: 0x43A047,
+  'verde oscuro': 0x1B5E20,
+  amarillo: 0xFDD835,
+  naranja: 0xFB8C00,
+  rosa: 0xEC407A,
+  negro: 0x23272A,
+  blanco: 0xFFFFFF,
+  gris: 0x95A5A6,
+  'gris oscuro': 0x424549,
+  turquesa: 0x1ABC9C,
+  cian: 0x00BCD4,
+  cyan: 0x00BCD4,
+  magenta: 0xD81B60,
+  dorado: 0xD4AF37,
+  oro: 0xD4AF37
+};
+function resolveEmbedColor(value) {
+  if (!value || !value.trim()) return EMBED_COLOR_NAMES.morado;
+  const raw = value.trim();
+  const hex = raw.startsWith('#') ? raw.slice(1) : raw;
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) return Number.parseInt(hex, 16);
+  const normalized = raw.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return Object.prototype.hasOwnProperty.call(EMBED_COLOR_NAMES, normalized)
+    ? EMBED_COLOR_NAMES[normalized]
+    : null;
+}
+function readEmbedFieldPair(interaction, nameId, valueId, label) {
+  const name = interaction.fields.getTextInputValue(nameId).trim();
+  const value = interaction.fields.getTextInputValue(valueId).trim();
+  if (!name && !value) return { field: null, error: null };
+  if (!name || !value) {
+    return { field: null, error: `En el campo ${label}, completá tanto el nombre como el valor.` };
+  }
+  if (name.length > 256 || value.length > 1024) {
+    return { field: null, error: `El campo ${label} supera el límite: el nombre admite 256 caracteres y el valor 1024.` };
+  }
+  return { field: { name, value, inline: false }, error: null };
+}
+function buildEmbedRoleComponents(userId, selectedRoleId = null) {
+  const roleSelect = new RoleSelectMenuBuilder()
+    .setCustomId(`sae_embed_role:${userId}`)
+    .setPlaceholder('Elegir rol para mencionar (opcional)')
+    .setMaxValues(1);
+  if (selectedRoleId) roleSelect.setDefaultRoles(selectedRoleId);
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sae_embed_remove_role:${userId}`)
+      .setLabel('Sin mención')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`sae_embed_continue:${userId}`)
+      .setLabel('Continuar')
+      .setStyle(ButtonStyle.Primary)
+  );
+  return [new ActionRowBuilder().addComponents(roleSelect), buttons];
+}
+function buildEmbedFieldActionRow(userId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sae_embed_addfields:${userId}`)
+      .setLabel('Agregar campos')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`sae_embed_publish:${userId}`)
+      .setLabel('Publicar embed')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`sae_embed_cancel:${userId}`)
+      .setLabel('Cancelar')
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+function buildAddEmbedFieldsModal(userId) {
+  const modal = new ModalBuilder()
+    .setCustomId(`sae_embed_addfields_submit:${userId}`)
+    .setTitle('Agregar campos al embed');
+  const components = [];
+  for (let i = 1; i <= 2; i++) {
+    const nameInput = new TextInputBuilder()
+      .setCustomId(`embed_extra${i}_name`)
+      .setLabel(`Nombre del campo ${i}`)
+      .setPlaceholder('Ej.: Precio, Horario, Información...')
+      .setStyle(TextInputStyle.Short)
+      .setMaxLength(256)
+      .setRequired(false);
+    const valueInput = new TextInputBuilder()
+      .setCustomId(`embed_extra${i}_value`)
+      .setLabel(`Valor del campo ${i}`)
+      .setStyle(TextInputStyle.Paragraph)
+      .setMaxLength(1024)
+      .setRequired(false);
+    components.push(new ActionRowBuilder().addComponents(nameInput));
+    components.push(new ActionRowBuilder().addComponents(valueInput));
+  }
+  modal.addComponents(...components);
+  return modal;
+}
+// CLIENTE DE DISCORD
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel]
+});
+// INTERACCIONES
+client.on(Events.InteractionCreate, async interaction => {
+  try {
+    // ====================================================
+    // /EMBED SIMPLE: color, título y descripción
+    // ====================================================
+    if (interaction.isChatInputCommand() && interaction.commandName === 'embed') {
+      if (!(await ensureOwner(interaction))) return;
+      const channel = interaction.options.getChannel('canal');
+      if (
+        !channel ||
+        ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)
+      ) {
+        return interaction.reply({
+          content: 'Elegí un canal de texto válido.',
+          ephemeral: true
+        });
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`sae_embed_simple:${interaction.user.id}:${channel.id}`)
+        .setTitle('Crear embed');
+      const colorInput = new TextInputBuilder()
+        .setCustomId('embed_simple_color')
+        .setLabel('Color (nombre o HEX)')
+        .setPlaceholder('Morado, rojo, azul o #5865F2')
+        .setStyle(TextInputStyle.Short)
+        .setMaxLength(30)
+        .setRequired(false);
+      const titleInput = new TextInputBuilder()
+        .setCustomId('embed_simple_title')
+        .setLabel('Título')
+        .setStyle(TextInputStyle.Short)
+        .setMaxLength(256)
+        .setRequired(false);
+      const descriptionInput = new TextInputBuilder()
+        .setCustomId('embed_simple_description')
+        .setLabel('Descripción')
+        .setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(4000)
+        .setRequired(false);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(colorInput),
+        new ActionRowBuilder().addComponents(titleInput),
+        new ActionRowBuilder().addComponents(descriptionInput)
+      );
+      return interaction.showModal(modal);
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('sae_embed_simple:')) {
+      const [, ownerId, channelId] = interaction.customId.split(':');
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: 'Este formulario pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const colorText = interaction.fields.getTextInputValue('embed_simple_color').trim();
+      const title = interaction.fields.getTextInputValue('embed_simple_title').trim();
+      const description = interaction.fields.getTextInputValue('embed_simple_description').trim();
+      const color = resolveEmbedColor(colorText);
+      if (color === null) {
+        return interaction.reply({
+          content: 'Color no válido. Usá un nombre conocido (por ejemplo, morado o azul) o un HEX como #5865F2.',
+          ephemeral: true
+        });
+      }
+      if (!title && !description) {
+        return interaction.reply({ content: 'Completá al menos el título o la descripción.', ephemeral: true });
+      }
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (
+        !channel ||
+        ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)
+      ) {
+        return interaction.reply({ content: 'No pude encontrar el canal de texto seleccionado.', ephemeral: true });
+      }
+      const embed = new EmbedBuilder().setColor(color);
+      if (title) embed.setTitle(title);
+      if (description) embed.setDescription(description);
+      const message = await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+      return interaction.reply({
+        content: `Embed publicado correctamente: ${message.url}`,
+        ephemeral: true
+      });
+    }
+    // FORMULARIO 1: guardar diseño y mostrar selector de rol opcional.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('sae_embed_step1:')) {
+      const [, ownerId, channelId] = interaction.customId.split(':');
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este formulario pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const title = interaction.fields.getTextInputValue('embed_title').trim();
+      const description = interaction.fields.getTextInputValue('embed_description').trim();
+      const rawColor = interaction.fields.getTextInputValue('embed_color').trim();
+      const imageUrl = interaction.fields.getTextInputValue('embed_image').trim();
+      const footer = interaction.fields.getTextInputValue('embed_footer').trim();
+      const color = resolveEmbedColor(rawColor);
+      if (rawColor && color === null) {
+        return interaction.reply({
+          content: '❌ No reconozco ese color. Probá con morado, rojo, azul, verde, amarillo, naranja, rosa, negro, blanco, gris, celeste, turquesa, cian, magenta o dorado.',
+          ephemeral: true
+        });
+      }
+      if (imageUrl && !isValidHttpUrl(imageUrl)) {
+        return interaction.reply({
+          content: '❌ La imagen debe tener una URL válida que empiece con `http://` o `https://`.',
+          ephemeral: true
+        });
+      }
+      const draftKey = `${interaction.guildId}:${interaction.user.id}`;
+      embedDrafts.set(draftKey, {
+        guildId: interaction.guildId,
+        userId: interaction.user.id,
+        channelId,
+        title,
+        description,
+        color,
+        imageUrl,
+        footer,
+        link: '',
+        fields: [],
+        pingRoleId: null
+      });
+      return interaction.reply({
+        content: '✅ Diseño guardado. Elegí un rol en el selector si querés mencionarlo. **@everyone no se puede mencionar desde este constructor.** Después pulsá Continuar.',
+        components: buildEmbedRoleComponents(interaction.user.id),
+        ephemeral: true
+      });
+    }
+    // SELECTOR DE ROL: permite escoger un único rol real del servidor.
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('sae_embed_role:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este selector pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draftKey = `${interaction.guildId}:${interaction.user.id}`;
+      const draft = embedDrafts.get(draftKey);
+      if (!draft || draft.userId !== interaction.user.id || draft.guildId !== interaction.guildId) {
+        return interaction.reply({ content: '❌ No encontré el embed en preparación. Ejecutá `/embed` otra vez.', ephemeral: true });
+      }
+      const roleId = interaction.values?.[0];
+      if (!roleId) {
+        draft.pingRoleId = null;
+        return interaction.update({
+          content: '✅ No se mencionará ningún rol. **@everyone no está permitido.** Podés continuar cuando quieras.',
+          components: buildEmbedRoleComponents(interaction.user.id, null)
+        });
+      }
+      if (roleId === interaction.guild.id) {
+        return interaction.reply({ content: '❌ No se puede seleccionar ni mencionar @everyone.', ephemeral: true });
+      }
+      const role = await interaction.guild.roles.fetch(roleId).catch(() => null);
+      if (!role || role.id === interaction.guild.id) {
+        return interaction.reply({ content: '❌ Ese rol no es válido para mencionar.', ephemeral: true });
+      }
+      draft.pingRoleId = role.id;
+      return interaction.update({
+        content: `✅ Rol seleccionado para mencionar: ${role}. @everyone está bloqueado. Pulsá Continuar cuando termines.`,
+        components: buildEmbedRoleComponents(interaction.user.id, draft.pingRoleId)
+      });
+    }
+    // Quitar la mención elegida.
+    if (interaction.isButton() && interaction.customId.startsWith('sae_embed_remove_role:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este botón pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draft = embedDrafts.get(`${interaction.guildId}:${interaction.user.id}`);
+      if (!draft) return interaction.reply({ content: '❌ No encontré el embed en preparación.', ephemeral: true });
+      draft.pingRoleId = null;
+      return interaction.update({
+        content: '✅ Listo: no se mencionará ningún rol. Pulsá Continuar para seguir.',
+        components: buildEmbedRoleComponents(interaction.user.id, null)
+      });
+    }
+    // BOTÓN PARA ABRIR EL FORMULARIO CON ENLACE Y DOS CAMPOS NORMALES.
+    if (interaction.isButton() && interaction.customId.startsWith('sae_embed_continue:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este botón pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draft = embedDrafts.get(`${interaction.guildId}:${interaction.user.id}`);
+      if (!draft || draft.guildId !== interaction.guildId || draft.userId !== interaction.user.id) {
+        return interaction.reply({ content: '❌ No encontré el primer formulario. Ejecutá `/embed` otra vez.', ephemeral: true });
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`sae_embed_step2:${interaction.user.id}`)
+        .setTitle('Enlace y campos · 2/2');
+      const linkInput = new TextInputBuilder()
+        .setCustomId('embed_link')
+        .setLabel('Enlace del título (opcional)')
+        .setPlaceholder('https://...')
+        .setStyle(TextInputStyle.Short)
+        .setMaxLength(400)
+        .setRequired(false);
+      const field1Name = new TextInputBuilder()
+        .setCustomId('embed_field1_name')
+        .setLabel('Nombre del campo 1')
+        .setPlaceholder('Ej.: Precio, Horario, Información...')
+        .setStyle(TextInputStyle.Short)
+        .setMaxLength(256)
+        .setRequired(false);
+      const field1Value = new TextInputBuilder()
+        .setCustomId('embed_field1_value')
+        .setLabel('Valor del campo 1')
+        .setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1024)
+        .setRequired(false);
+      const field2Name = new TextInputBuilder()
+        .setCustomId('embed_field2_name')
+        .setLabel('Nombre del campo 2')
+        .setStyle(TextInputStyle.Short)
+        .setMaxLength(256)
+        .setRequired(false);
+      const field2Value = new TextInputBuilder()
+        .setCustomId('embed_field2_value')
+        .setLabel('Valor del campo 2')
+        .setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1024)
+        .setRequired(false);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(linkInput),
+        new ActionRowBuilder().addComponents(field1Name),
+        new ActionRowBuilder().addComponents(field1Value),
+        new ActionRowBuilder().addComponents(field2Name),
+        new ActionRowBuilder().addComponents(field2Value)
+      );
+      return interaction.showModal(modal);
+    }
+    // GUARDAR ENLACE Y LOS CAMPOS DEL SEGUNDO FORMULARIO.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('sae_embed_step2:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este formulario pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draftKey = `${interaction.guildId}:${interaction.user.id}`;
+      const draft = embedDrafts.get(draftKey);
+      if (!draft || draft.guildId !== interaction.guildId || draft.userId !== interaction.user.id) {
+        return interaction.reply({ content: '❌ No encontré el primer formulario. Ejecutá `/embed` otra vez.', ephemeral: true });
+      }
+      const link = interaction.fields.getTextInputValue('embed_link').trim();
+      if (link && !isValidHttpUrl(link)) {
+        return interaction.reply({ content: '❌ El enlace tiene que empezar con `http://` o `https://`. Pulsá Continuar para corregirlo.', ephemeral: true });
+      }
+      const pair1 = readEmbedFieldPair(interaction, 'embed_field1_name', 'embed_field1_value', '1');
+      const pair2 = readEmbedFieldPair(interaction, 'embed_field2_name', 'embed_field2_value', '2');
+      const fieldError = pair1.error || pair2.error;
+      if (fieldError) {
+        return interaction.reply({ content: `❌ ${fieldError} Pulsá Continuar para corregirlo.`, ephemeral: true });
+      }
+      const newFields = [pair1.field, pair2.field].filter(Boolean);
+      if (draft.fields.length + newFields.length > 25) {
+        return interaction.reply({ content: '❌ Un embed admite como máximo 25 campos.', ephemeral: true });
+      }
+      draft.link = link;
+      draft.fields.push(...newFields);
+      const roleSummary = draft.pingRoleId ? `Rol que se mencionará: <@&${draft.pingRoleId}>.` : 'No se mencionará ningún rol.';
+      return interaction.reply({
+        content: `✅ Guardado. Campos: **${draft.fields.length}/25**. ${roleSummary}\nPodés agregar más campos o publicar el embed. @everyone no está permitido.`,
+        components: [buildEmbedFieldActionRow(interaction.user.id)],
+        ephemeral: true
+      });
+    }
+    // AGREGAR CAMPOS EXTRA, EN PARES DE NOMBRE Y VALOR.
+    if (interaction.isButton() && interaction.customId.startsWith('sae_embed_addfields:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este botón pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draft = embedDrafts.get(`${interaction.guildId}:${interaction.user.id}`);
+      if (!draft || draft.guildId !== interaction.guildId) {
+        return interaction.reply({ content: '❌ No encontré el embed en preparación.', ephemeral: true });
+      }
+      if (draft.fields.length >= 25) {
+        return interaction.reply({ content: '❌ Ya llegaste al límite de 25 campos.', ephemeral: true });
+      }
+      return interaction.showModal(buildAddEmbedFieldsModal(interaction.user.id));
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('sae_embed_addfields_submit:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este formulario pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draftKey = `${interaction.guildId}:${interaction.user.id}`;
+      const draft = embedDrafts.get(draftKey);
+      if (!draft || draft.guildId !== interaction.guildId) {
+        return interaction.reply({ content: '❌ No encontré el embed en preparación.', ephemeral: true });
+      }
+      const pair1 = readEmbedFieldPair(interaction, 'embed_extra1_name', 'embed_extra1_value', '1');
+      const pair2 = readEmbedFieldPair(interaction, 'embed_extra2_name', 'embed_extra2_value', '2');
+      const fieldError = pair1.error || pair2.error;
+      if (fieldError) {
+        return interaction.reply({ content: `❌ ${fieldError} Volvé a pulsar **Agregar campos** para intentarlo otra vez.`, components: [buildEmbedFieldActionRow(interaction.user.id)], ephemeral: true });
+      }
+      const newFields = [pair1.field, pair2.field].filter(Boolean);
+      if (newFields.length === 0) {
+        return interaction.reply({ content: 'No agregaste ningún campo. Podés probar otra vez o publicar el embed como está.', components: [buildEmbedFieldActionRow(interaction.user.id)], ephemeral: true });
+      }
+      if (draft.fields.length + newFields.length > 25) {
+        return interaction.reply({ content: `❌ Ya hay ${draft.fields.length} campos. El límite de Discord es 25; agregá como máximo ${25 - draft.fields.length}.`, components: [buildEmbedFieldActionRow(interaction.user.id)], ephemeral: true });
+      }
+      draft.fields.push(...newFields);
+      const roleSummary = draft.pingRoleId ? `Rol que se mencionará: <@&${draft.pingRoleId}>.` : 'No se mencionará ningún rol.';
+      return interaction.reply({
+        content: `✅ Campos guardados: **${draft.fields.length}/25**. ${roleSummary}\nPodés agregar más campos o publicar el embed.`,
+        components: [buildEmbedFieldActionRow(interaction.user.id)],
+        ephemeral: true
+      });
+    }
+    // PUBLICAR EMBED; SOLO SE PUEDE MENCIONAR EL ROL ELEGIDO EN EL SELECTOR.
+    if (interaction.isButton() && interaction.customId.startsWith('sae_embed_publish:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este botón pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const draftKey = `${interaction.guildId}:${interaction.user.id}`;
+      const draft = embedDrafts.get(draftKey);
+      if (!draft || draft.guildId !== interaction.guildId || draft.userId !== interaction.user.id) {
+        return interaction.reply({ content: '❌ No encontré el embed en preparación. Ejecutá `/embed` otra vez.', ephemeral: true });
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const channel = await client.channels.fetch(draft.channelId).catch(() => null);
+      if (!channel || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type) || !channel.isTextBased()) {
+        return interaction.editReply({ content: '❌ El canal elegido ya no existe o no permite enviar mensajes.' });
+      }
+      let role = null;
+      if (draft.pingRoleId) {
+        if (draft.pingRoleId === interaction.guild.id) {
+          return interaction.editReply({ content: '❌ @everyone está bloqueado. Volvé a crear el embed y elegí un rol concreto.' });
+        }
+        role = await interaction.guild.roles.fetch(draft.pingRoleId).catch(() => null);
+        if (!role || role.id === interaction.guild.id) {
+          return interaction.editReply({ content: '❌ El rol seleccionado ya no existe o no se puede mencionar. Volvé a crear el embed.' });
+        }
+        const botMember = interaction.guild.members.me || await interaction.guild.members.fetchMe().catch(() => null);
+        const canMentionRole = role.mentionable || Boolean(
+          botMember && channel.permissionsFor(botMember)?.has(PermissionFlagsBits.MentionEveryone)
+        );
+        if (!canMentionRole) {
+          return interaction.editReply({
+            content: `❌ No puedo mencionar ${role} porque no es un rol mencionable y el bot no tiene permiso para mencionar roles en ${channel}. Elegí un rol mencionable o ajustá sus permisos. @everyone seguirá bloqueado.`
+          });
+        }
+      }
+      const embed = new EmbedBuilder().setColor(draft.color);
+      if (draft.title) embed.setTitle(draft.title);
+      if (draft.description) embed.setDescription(draft.description);
+      if (draft.imageUrl) embed.setImage(draft.imageUrl);
+      if (draft.footer) embed.setFooter({ text: draft.footer });
+      if (draft.fields.length) embed.addFields(draft.fields);
+      if (draft.link && draft.title) {
+        embed.setURL(draft.link);
+      } else if (draft.link) {
+        embed.setDescription([draft.description, `[Abrir enlace](${draft.link})`].filter(Boolean).join('\n\n'));
+      }
+      if (!draft.title && !draft.description && !draft.imageUrl && !draft.footer && !draft.link && draft.fields.length === 0) {
+        return interaction.editReply({ content: '❌ El embed está vacío. Volvé a `/embed` y agregá título, descripción, imagen, pie o campos.' });
+      }
+      const totalEmbedCharacters =
+        (draft.title || '').length +
+        (draft.description || '').length +
+        (draft.footer || '').length +
+        draft.fields.reduce((total, field) => total + field.name.length + field.value.length, 0);
+      if (totalEmbedCharacters > 6000) {
+        return interaction.editReply({ content: `❌ El embed supera los 6000 caracteres permitidos (ahora tiene ${totalEmbedCharacters}). Reducí el texto antes de publicarlo.` });
+      }
+      const payload = {
+        embeds: [embed],
+        allowedMentions: role ? { parse: [], roles: [role.id] } : { parse: [], roles: [] }
+      };
+      if (role) payload.content = `<@&${role.id}>`;
+      const message = await channel.send(payload);
+      embedDrafts.delete(draftKey);
+      return interaction.editReply({ content: `✅ Embed publicado en ${channel}. [Ver mensaje](${message.url})` });
+    }
+    // CANCELAR Y BORRAR EL BORRADOR.
+    if (interaction.isButton() && interaction.customId.startsWith('sae_embed_cancel:')) {
+      const ownerId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Este botón pertenece a otro usuario.', ephemeral: true });
+      }
+      if (!(await ensureOwner(interaction))) return;
+      embedDrafts.delete(`${interaction.guildId}:${interaction.user.id}`);
+      return interaction.update({ content: '🗑️ Se canceló el constructor y se borró el borrador.', components: [] });
+    }
+    // BOT GUARDIAN: comandos administrativos
+    if (interaction.isChatInputCommand() && ['warn', 'documentacion', 'sendmessage'].includes(interaction.commandName)) {
+      if (!interaction.inGuild() || !interaction.guild || !guardianIsAllowedGuild(interaction)) {
+        await interaction.reply({ content: 'Este comando solo está habilitado en el servidor configurado.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const command = interaction.commandName;
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const allowed = command === 'warn' ? guardianCanWarn(member) : guardianCanAdmin(member);
+      if (!allowed) {
+        await interaction.reply({ content: 'No tienes autorización para utilizar este comando.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (command === 'warn') {
+        const user = interaction.options.getUser('usuario', true);
+        const reason = interaction.options.getString('motivo', true).trim();
+        if (user.bot) {
+          await interaction.reply({ content: 'No se pueden registrar advertencias para bots.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const result = await guardianAddWarning(interaction.guild, user, reason, 'manual');
+        await interaction.reply({
+          embeds: [new EmbedBuilder().setColor(0x475569).setTitle('Advertencia registrada').setDescription(
+            `Usuario: ${user.tag}\nTotal de advertencias: ${result.total}\nMotivo: ${reason}\nSanción: ${result.sanction}`
+          ).setTimestamp(new Date())],
+          flags: MessageFlags.Ephemeral,
+          allowedMentions: { parse: [] }
+        });
+        return;
+      }
+      if (command === 'documentacion') {
+        const user = interaction.options.getUser('usuario', true);
+        const warnings = getGuardianUserRecord(interaction.guildId, user.id);
+        const recent = warnings.slice(-15);
+        const startNumber = warnings.length - recent.length;
+        const details = recent.map((warning, index) => {
+          const date = new Date(warning.createdAt).toLocaleString('es-UY', { timeZone: 'America/Montevideo' });
+          return `${startNumber + index + 1}. Motivo: ${warning.reason}\n   Fecha: ${date}`;
+        });
+        const description = `Usuario: ${user.tag} (${user.id})\nTotal: ${warnings.length} WARNS\n\n` +
+          (details.length ? details.join('\n\n') : 'No hay advertencias registradas.');
+        await interaction.reply({
+          embeds: [new EmbedBuilder().setColor(warnings.length ? 0xB45309 : 0x475569).setTitle('Documentación del usuario').setDescription(description).setTimestamp(new Date())],
+          flags: MessageFlags.Ephemeral,
+          allowedMentions: { parse: [] }
+        });
+        return;
+      }
+      const channel = interaction.options.getChannel('canal') || interaction.channel;
+      if (!channel?.isTextBased() || !channel.isSendable()) {
+        await interaction.reply({ content: 'No se encontró un canal de texto válido para el envío.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (command === 'sendmessage') {
+        const content = interaction.options.getString('contenido', true);
+        const userToMention = interaction.options.getUser('mencionar');
+        const attachment = interaction.options.getAttachment('archivo');
+        const text = `${userToMention ? `<@${userToMention.id}>\n` : ''}${content}`;
+        try {
+          await channel.send({
+            content: text,
+            files: attachment ? [{ attachment: attachment.url, name: attachment.name }] : [],
+            allowedMentions: userToMention ? { users: [userToMention.id], parse: [] } : { parse: [] }
+          });
+          await interaction.reply({ content: 'El mensaje se ha enviado correctamente.', flags: MessageFlags.Ephemeral });
+        } catch (error) {
+          console.error('BOT GUARDIAN /sendmessage:', error);
+          await interaction.reply({ content: 'No se pudo enviar el mensaje. Comprueba los permisos del bot y el archivo adjunto.', flags: MessageFlags.Ephemeral });
+        }
+        return;
+      }
+    }
+// /ADDPREDICTION
+    if (
+      interaction.isChatInputCommand() &&
+      interaction.commandName === 'addprediction'
+    ) {
+      if (!(await ensureOwner(interaction))) return;
+      await interaction.reply({
+        content: '👑 **ADDPREDICTION**\n\n¿Qué personaje querés predecir?',
+        components: buildDivineSelectRows(interaction.user.id, 0),
+        ephemeral: true
+      });
+      return;
+    }
+// PÁGINAS DEL MENÚ
+    if (
+      interaction.isButton() &&
+      interaction.customId.startsWith('addprediction_page:')
+    ) {
+      const parts = interaction.customId.split(':');
+      const ownerId = parts[1];
+      const page = Number(parts[2]);
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+          content: '❌ Este menú pertenece a otro usuario.',
+          ephemeral: true
+        });
+        return;
+      }
+      if (!(await ensureOwner(interaction))) return;
+      if (
+        !Number.isInteger(page) ||
+        page < 0 ||
+        page >= Math.ceil(config.divines.length / DIVINE_PAGE_SIZE)
+      ) {
+        await interaction.reply({
+          content: '❌ Página inválida.',
+          ephemeral: true
+        });
+        return;
+      }
+      await interaction.update({
+        content: '👑 **ADDPREDICTION**\n\n¿Qué personaje querés predecir?',
+        components: buildDivineSelectRows(interaction.user.id, page)
+      });
+      return;
+    }
+// ELEGIR DIVINE
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId.startsWith('addprediction_divine:')
+    ) {
+      const parts = interaction.customId.split(':');
+      const ownerId = parts[1];
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+          content: '❌ Este menú pertenece a otro usuario.',
+          ephemeral: true
+        });
+        return;
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const selectedKey = interaction.values[0];
+      const divine = config.divines.find(
+        item => item.key === selectedKey
+      );
+      if (!divine) {
+        await interaction.reply({
+          content: '❌ No encontré ese Divine en config.json.',
+          ephemeral: true
+        });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(
+          `addprediction_modal:${interaction.user.id}:${encodeURIComponent(divine.key)}`
+        )
+        .setTitle('Añadir Divine Prediction');
+      const firstTimeInput = new TextInputBuilder()
+        .setCustomId('hora1')
+        .setLabel('Primer horario (HH:mm)')
+        .setPlaceholder('Ejemplo: 19:30')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(5)
+        .setMaxLength(5)
+        .setRequired(true);
+      const secondTimeInput = new TextInputBuilder()
+        .setCustomId('hora2')
+        .setLabel('Segundo horario (HH:mm)')
+        .setPlaceholder('Ejemplo: 23:30')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(5)
+        .setMaxLength(5)
+        .setRequired(true);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(firstTimeInput),
+        new ActionRowBuilder().addComponents(secondTimeInput)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+// HORARIOS INTRODUCIDOS EN EL MODAL
+    if (
+      interaction.isModalSubmit() &&
+      interaction.customId.startsWith('addprediction_modal:')
+    ) {
+      const parts = interaction.customId.split(':');
+      const ownerId = parts[1];
+      const divineKey = decodeURIComponent(parts.slice(2).join(':'));
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+          content: '❌ Este formulario pertenece a otro usuario.',
+          ephemeral: true
+        });
+        return;
+      }
+      if (!(await ensureOwner(interaction))) return;
+      const divine = config.divines.find(
+        item => item.key === divineKey
+      );
+      if (!divine) {
+        await interaction.reply({
+          content: '❌ No encontré ese Divine en config.json.',
+          ephemeral: true
+        });
+        return;
+      }
+      const firstInput = interaction.fields
+        .getTextInputValue('hora1')
+        .trim();
+      const secondInput = interaction.fields
+        .getTextInputValue('hora2')
+        .trim();
+      const firstTime = parseUpcomingClockTime(firstInput);
+      const secondTime = parseUpcomingClockTime(secondInput);
+      if (!firstTime || !secondTime) {
+        await interaction.reply({
+          content: '❌ Horario inválido. Usá HH:mm, por ejemplo **09:05**, **17:30** o **23:55**.',
+          ephemeral: true
+        });
+        return;
+      }
+      if (
+        firstTime.minute % 5 !== 0 ||
+        secondTime.minute % 5 !== 0
+      ) {
+        await interaction.reply({
+          content: '❌ Los horarios deben estar en múltiplos de 5 minutos. Ejemplos: **19:00**, **19:05**, **19:10**, **19:15**.',
+          ephemeral: true
+        });
+        return;
+      }
+      const orderedTimes = [
+        firstTime,
+        secondTime
+      ].sort((a, b) => a.toMillis() - b.toMillis());
+      const channel = await client.channels.fetch(CHANNEL_ID);
+      if (!channel || !channel.isTextBased()) {
+        throw new Error(
+          'PREDICTION_CHANNEL_ID no apunta a un canal de texto.'
+        );
+      }
+      const lastSeenData = await getSenzLastSeen(client);
+      const chance = getSenzDivineChance(divine, lastSeenData);
+      const embed = buildManualPredictionEmbed(
+        divine,
+        orderedTimes[0],
+        orderedTimes[1],
+        chance
+      );
+      const message = await channel.send({
+        content: `<@&${PREDICTION_ROLE_ID}>`,
+        embeds: [embed],
+        allowedMentions: {
+          parse: [],
+          roles: [PREDICTION_ROLE_ID]
+        }
+      });
+      await addDivineReactions(message);
+      await interaction.reply({
+        content:
+          `✅ Predicción publicada para **${getDivineDisplay(divine)}** en ${channel}.\n` +
+          `[Ver mensaje](${message.url})`,
+        ephemeral: true
+      });
+      console.log(
+        `✅ Predicción manual publicada: ${divine.key} — ${message.url}`
+      );
+      return;
+    }
+  } catch (error) {
+    console.error('❌ Error procesando interacción:', error);
+    if (interaction.isRepliable()) {
+      const payload = {
+        content:
+          '❌ Hubo un error procesando la interacción. Revisá la consola; también puede faltar algún dato de SenZ.',
+        ephemeral: true
+      };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(payload).catch(() => {});
+      } else {
+        await interaction.reply(payload).catch(() => {});
+      }
+    }
+  }
+});
+// EVENTO READY
+client.once(Events.ClientReady, async readyClient => {
+  console.log(
+    `SAE PREDICTION conectado como ${readyClient.user.tag}`
+  );
+  readyClient.user.setActivity('SAE Predictions', {
+    type: ActivityType.Watching
+  });
+  await registerSlashCommands(readyClient);
+  const now = DateTime.now().setZone(TIMEZONE);
+  const scheduledToday = now.set({
+    hour: PREDICTION_HOUR,
+    minute: PREDICTION_MINUTE,
+    second: 0,
+    millisecond: 0
+  });
+  if (now >= scheduledToday) {
+    try {
+      await publishDailyPrediction(readyClient);
+    } catch (error) {
+      console.error(
+        'Error recuperando la predicción del día:',
+        error
+      );
+    }
+  }
+  console.log('✅ Sistema de predicciones listo.');
+  console.log('✅ Sistema /addprediction cargado.');
+  console.log(`🕒 Zona horaria: ${TIMEZONE}`);
+});
+// REPLICADOR DE PINGS DE SENZ V2
+client.on(Events.MessageCreate, async message => {
+  try {
+    if (
+      !message.guild ||
+      message.channelId !== SENZ_PING_CHANNEL_ID ||
+      !message.author.bot ||
+      (client.user && message.author.id === client.user.id)
+    ) {
+      return;
+    }
+    const searchableText = [
+      message.content || '',
+      ...message.embeds.flatMap(embed => [
+        embed.title || '',
+        embed.description || '',
+        ...(embed.fields || []).flatMap(field => [
+          field.name || '',
+          field.value || ''
+        ])
+      ])
+    ].join('\n');
+    const detectedRoleIds = new Set();
+    for (const role of message.mentions.roles.values()) {
+      if (SENZ_PING_ROLE_IDS.has(role.id)) {
+        detectedRoleIds.add(role.id);
+      }
+    }
+    for (const roleId of SENZ_PING_ROLE_IDS) {
+      if (
+        searchableText.includes(`<@&${roleId}>`) ||
+        searchableText.includes(roleId)
+      ) {
+        detectedRoleIds.add(roleId);
+      }
+    }
+    if (detectedRoleIds.size === 0) return;
+    await message.channel.send({
+      content: [...detectedRoleIds].map(roleId => `<@&${roleId}>`).join(' '),
+      allowedMentions: {
+        parse: [],
+        roles: [...detectedRoleIds],
+        users: [],
+        repliedUser: false
+      }
+    });
+    console.log(
+      `🔔 Pings de SenZ V2 replicados: ${[...detectedRoleIds].join(', ')}`
+    );
+  } catch (error) {
+    console.error('❌ Error replicando pings de SenZ V2:', error);
+  }
+});
+// BOT GUARDIAN: detección de @here no autorizado
+client.on(Events.MessageCreate, async message => {
+  try {
+    if (!message.guild || message.author.bot || !message.mentions.everyone || !/@here\b/i.test(message.content)) return;
+    if (!GUARDIAN_GUILD_ID || message.guild.id !== GUARDIAN_GUILD_ID) return;
+    const member = message.member || await message.guild.members.fetch(message.author.id).catch(() => null);
+    if (memberHasOneOf(member, GUARDIAN_HERE_EXEMPT_ROLE_IDS)) return;
+    const result = await guardianAddWarning(message.guild, message.author, 'Uso de @here', 'automatico');
+    const dmSent = await guardianSendDm(message.author, 'Si sigues usando el @here te ira mal.');
+    if (!dmSent) console.warn(`BOT GUARDIAN: no se pudo enviar DM a ${message.author.tag}; los mensajes privados pueden estar cerrados.`);
+    console.log(`BOT GUARDIAN: @here no autorizado de ${message.author.tag}; warns=${result.total}.`);
+  } catch (error) {
+    console.error('BOT GUARDIAN: error detectando @here:', error);
+  }
+});
+// MENSAJES: ANTI-@EVERYONE, PERSONALIDAD Y COMANDOS DE OWNER
+client.on(Events.MessageCreate, async message => {
+  if (message.author.bot || !message.guild) {
+    return;
+  }
+// ANTI-@EVERYONE
+  if (message.content.toLowerCase().includes('@everyone')) {
+    const hasExemptRole = message.member?.roles?.cache?.some(role =>
+      EVERYONE_EXEMPT_ROLE_IDS.has(role.id)
+    ) || false;
+    if (!hasExemptRole) {
+      const recordKey = `${message.guild.id}:${message.author.id}`;
+      const previousRecord = state.antiEveryone[recordKey] || {
+        total: 0,
+        updatedAt: null
+      };
+      const total = Number(previousRecord.total || 0) + 1;
+      const now = Date.now();
+      const weeklyThreshold = 27;
+      const weeklyMode = Number(previousRecord.total || 0) >= weeklyThreshold;
+      const isSanction = total % 3 === 0 || weeklyMode;
+      state.antiEveryone[recordKey] = {
+        total,
+        updatedAt: new Date(now).toISOString(),
+        lastGuildId: message.guild.id,
+        lastChannelId: message.channel.id
+      };
+// Guardar el contador inmediatamente.
+      try {
+        saveState();
+      } catch (error) {
+        console.error('❌ Anti-@everyone: no se pudo guardar el historial:', error);
+      }
+      try {
+        await message.delete();
+      } catch (error) {
+        console.error('❌ Anti-@everyone: no se pudo borrar el mensaje:', error.message);
+      }
+      if (isSanction) {
+        const sanctionSteps = [
+          { at: 3, duration: 5 * 60 * 1000, label: '5 minutos' },
+          { at: 6, duration: 10 * 60 * 1000, label: '10 minutos' },
+          { at: 9, duration: 30 * 60 * 1000, label: '30 minutos' },
+          { at: 12, duration: 60 * 60 * 1000, label: '1 hora' },
+          { at: 15, duration: 6 * 60 * 60 * 1000, label: '6 horas' },
+          { at: 18, duration: 12 * 60 * 60 * 1000, label: '12 horas' },
+          { at: 21, duration: 24 * 60 * 60 * 1000, label: '1 día' },
+          { at: 24, duration: 3 * 24 * 60 * 60 * 1000, label: '3 días' },
+          { at: 27, duration: 7 * 24 * 60 * 60 * 1000, label: '1 semana' }
+        ];
+        const step = weeklyMode
+          ? { duration: 7 * 24 * 60 * 60 * 1000, label: '1 semana' }
+          : [...sanctionSteps].reverse().find(item => total >= item.at);
+        const member = message.member || await message.guild.members
+          .fetch(message.author.id)
+          .catch(() => null);
+        let timeoutApplied = false;
+        if (member && member.moderatable) {
+          try {
+            await member.timeout(
+              step.duration,
+              `Uso no autorizado de @everyone (${total} detecciones)`
+            );
+            timeoutApplied = true;
+          } catch (error) {
+            console.error('❌ Anti-@everyone: no se pudo aplicar timeout:', error.message);
+          }
+        } else {
+          console.error(`❌ Anti-@everyone: no puedo aislar a ${message.author.tag}.`);
+        }
+        const dmText = timeoutApplied
+          ? `🚫 Usaste @everyone demasiadas veces.
+**Uso número:** ${total}
+**Sanción:** aislamiento de **${step.label}**.
+El mensaje fue eliminado. Después de alcanzar una semana, cada nuevo uso de @everyone conlleva otra semana de aislamiento.`
+          : `🚫 Usaste @everyone demasiadas veces.
+**Uso número:** ${total}
+**Sanción prevista:** aislamiento de **${step.label}**, pero el bot no pudo aplicarlo por falta de permisos o jerarquía. Avisá a un administrador.
+El mensaje fue eliminado si el bot tenía permiso.`;
+        await message.author.send(dmText).catch(error => {
+          console.warn(`⚠️ Anti-@everyone: no pude enviar DM a ${message.author.tag}:`, error.message);
+        });
+        console.log(
+          `🚫 Anti-@everyone: ${message.author.tag}, uso ${total}, sanción ${step.label}, aplicada=${timeoutApplied}`
+        );
+      } else {
+        const warning = ((total - 1) % 3) + 1;
+        const dmText = `⚠️ Usaste @everyone: **${warning}/3 advertencias**.
+El mensaje fue eliminado. Si llegás a 3 usos, recibirás un aislamiento temporal. Las advertencias y sanciones quedan guardadas aunque el bot se reinicie.`;
+        await message.author.send(dmText).catch(error => {
+          console.warn(`⚠️ Anti-@everyone: no pude enviar DM a ${message.author.tag}:`, error.message);
+        });
+        console.log(
+          `⚠️ Anti-@everyone: ${message.author.tag}, advertencia ${warning}/3 (uso ${total}).`
+        );
+      }
+      return;
+    }
+  }
+  const content = message.content.trim();
+// PERSONALIDAD DEL SAE PREDICTOR
+  const asksOpinion = /\bque\s+opinas(?:\s+de\s+esto)?\s*\\??/i.test(
+    content.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  );
+  if (
+    client.user &&
+    message.mentions.users.has(client.user.id) &&
+    asksOpinion
+  ) {
+    if (hasOwnerRole(message.member)) {
+      const respuestas = [
+        'Puro cuento 🥱',
+        'Que habla ese 😂'
+      ];
+      const respuesta =
+        respuestas[Math.floor(Math.random() * respuestas.length)];
+      await message.reply({
+        content: respuesta,
+        allowedMentions: { repliedUser: false }
+      });
+    } else {
+      await message.reply({
+        content: 'No tienes suficiente aura para que te haga caso 💀🥀',
+        allowedMentions: { repliedUser: false }
+      });
+    }
+    return;
+  }
+// Desde aquí, los otros comandos solo son para Owners.
+  if (!hasOwnerRole(message.member)) {
+    return;
+  }
+// BORRAR CANALES QUE TERMINEN EN "BASE"
+  if (content.toLowerCase() === '!borrarbases') {
+    const targets = message.guild.channels.cache.filter(channel =>
+      channel.name.toLowerCase().endsWith('base')
+    );
+    if (targets.size === 0) {
+      await message.reply('✅ No hay canales que terminen en "base".');
+      return;
+    }
+    await message.reply(
+      `⚠️ Encontré ${targets.size} canal(es) para eliminar.`
+    );
+    let deleted = 0;
+    let failed = 0;
+    for (const channel of targets.values()) {
+      try {
+        await channel.delete(
+          'Comando !borrarbases ejecutado por un Owner autorizado'
+        );
+        deleted++;
+      } catch (error) {
+        failed++;
+        console.error(
+          `Error eliminando ${channel.name} (${channel.id}):`,
+          error
+        );
+      }
+    }
+    await message.channel.send(
+      `🧹 **Limpieza terminada**\n` +
+      `✅ Eliminados: ${deleted}\n` +
+      `❌ Fallidos: ${failed}`
+    ).catch(() => {});
+    return;
+  }
+// GENERAR UNA NUEVA PREDICCIÓN AUTOMÁTICA
+  if (content.toLowerCase() === '!nuevaprediccion') {
+    try {
+      await publishDailyPrediction(client, { force: true });
+      await message.reply({
+        content: 'Nueva predicción subida maestro. <:Colossus:1557197762645467166>',
+        allowedMentions: { parse: [] }
+      });
+    } catch (error) {
+      console.error('Error en !nuevaprediccion:', error);
+      await message.reply(
+        '❌ No pude subir la predicción. Revisá la consola.'
+      );
+    }
+    return;
+  }
+// EDITAR UN DIVINE DE LA PREDICCIÓN AUTOMÁTICA
+  const time = parseTime(content);
+  if (!time) return;
+  const chance = parseChance(content);
+  const divine = findDivine(content);
+  if (!divine) return;
+  try {
+    const changed = await editCurrentPrediction(
+      client,
+      divine,
+      time,
+      chance
+    );
+    if (changed) {
+      await message.reply(
+        `✅ Predicción de **${getDivineDisplay(divine)}** actualizada.`
+      );
+    } else {
+      await message.reply(
+        '⚠️ No encontré ese Divine en la predicción actual o la fecha supera las 72 horas.'
+      );
+    }
+  } catch (error) {
+    console.error('Error editando predicción:', error);
+    await message.reply('❌ No pude editar la predicción.');
+  }
+});
+// PREDICCIÓN AUTOMÁTICA DIARIA
+cron.schedule(
+  `${PREDICTION_MINUTE} ${PREDICTION_HOUR} * * *`,
+  () => {
+    publishDailyPrediction(client).catch(error =>
+      console.error('Error en predicción diaria:', error)
+    );
+  },
+  {
+    timezone: TIMEZONE
+  }
+);
+// UFO EVENT - CADA HORA :00 Y :30
+cron.schedule(
+  '0,30 * * * *',
+  async () => {
+    console.log('Cron UFO EVENT disparado.');
+
+    const success = await publishUFOEvent(client);
+
+    if (!success) {
+      console.error('No se pudo publicar UFO EVENT.');
+    }
+  },
+  {
+    timezone: TIMEZONE
+  }
+);
+// ERRORES
+client.on('error', error => {
+  console.error('Discord Client Error:', error);
+});
+process.on('unhandledRejection', error => {
+  console.error('UNHANDLED REJECTION:', error);
+});
+process.on('uncaughtException', error => {
+  console.error('UNCAUGHT EXCEPTION:', error);
+});
+// LOGIN
+client.login(TOKEN);
