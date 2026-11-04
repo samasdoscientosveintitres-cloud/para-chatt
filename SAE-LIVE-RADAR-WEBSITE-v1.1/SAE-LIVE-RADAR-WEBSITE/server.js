@@ -13,6 +13,7 @@ const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const INQUIRIES_FILE = path.join(DATA_DIR, 'inquiries.json');
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = parsePort(process.env.PORT || '8080');
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
@@ -23,9 +24,36 @@ const MAX_BODY_BYTES = 16 * 1024;
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 14;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 8;
+const PRODUCT_PRICE = '4.99';
+const PRODUCT_CURRENCY = 'USD';
 const hitsByIp = new Map();
 let writeQueue = Promise.resolve();
 const scryptAsync = promisify(crypto.scrypt);
+let pgPool = null;
+function databasePool() {
+  if (!process.env.DATABASE_URL) return null;
+  if (!pgPool) {
+    const { Pool } = require('pg');
+    pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 });
+  }
+  return pgPool;
+}
+async function initDatabase() {
+  const pool = databasePool();
+  if (!pool) { if (process.env.NODE_ENV === 'production') throw new Error('DATABASE_URL es obligatorio en producción para conservar cuentas y compras.'); return; }
+  await pool.query('CREATE TABLE IF NOT EXISTS sae_radar_state (state_key TEXT PRIMARY KEY, state_value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
+  for (const [key, value, legacyFile] of [['users', {users:[]}, USERS_FILE], ['orders', [], ORDERS_FILE], ['inquiries', [], INQUIRIES_FILE]]) {
+    let initial=value;
+    try { const raw=JSON.parse(await fs.readFile(legacyFile,'utf8')); if(key==='users' && Array.isArray(raw.users)) initial=raw; else if(Array.isArray(raw)) initial=raw; } catch {}
+    await pool.query('INSERT INTO sae_radar_state(state_key,state_value) VALUES($1,$2::jsonb) ON CONFLICT(state_key) DO NOTHING', [key, JSON.stringify(initial)]);
+  }
+}
+async function dbRead(key, fallback) { const pool=databasePool(); if(!pool) return fallback; const r=await pool.query('SELECT state_value FROM sae_radar_state WHERE state_key=$1',[key]); return r.rows[0]?.state_value ?? fallback; }
+async function dbMutate(key, fallback, mutator) {
+  const pool=databasePool(); if(!pool) return null;
+  const client=await pool.connect();
+  try { await client.query('BEGIN'); await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`sae-radar:${key}`]); const r=await client.query('SELECT state_value FROM sae_radar_state WHERE state_key=$1 FOR UPDATE',[key]); const value=r.rows[0]?.state_value ?? fallback; const result=await mutator(value); await client.query('INSERT INTO sae_radar_state(state_key,state_value,updated_at) VALUES($1,$2::jsonb,NOW()) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=NOW()',[key,JSON.stringify(value)]); await client.query('COMMIT'); return result; } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, '.env');
@@ -208,39 +236,18 @@ function sessionCookie(req, token, maxAge = SESSION_MAX_AGE_SECONDS) {
 }
 
 async function loadUsers() {
+  if (databasePool()) return dbRead('users', { users: [] });
   await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    const raw = await fs.readFile(USERS_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed.users) ? parsed : { users: [] };
-  } catch (error) {
-    if (error.code === 'ENOENT') return { users: [] };
-    throw new Error('No se pudo leer el registro de cuentas. Revisá DATA_DIR/users.json.');
-  }
+  try { const raw=await fs.readFile(USERS_FILE,'utf8'); const parsed=JSON.parse(raw); return Array.isArray(parsed.users)?parsed:{users:[]}; }
+  catch(error) { if(error.code==='ENOENT') return {users:[]}; throw new Error('No se pudo leer el registro de cuentas.'); }
 }
-
 function saveUsers(store) {
-  writeQueue = writeQueue.then(async () => {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    const tempPath = `${USERS_FILE}.${process.pid}.tmp`;
-    await fs.writeFile(tempPath, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(tempPath, USERS_FILE);
-  });
-  return writeQueue;
+  if (databasePool()) return dbMutate('users', {users:[]}, current => { current.users=store.users; return true; });
+  writeQueue=writeQueue.then(async()=>{ await fs.mkdir(DATA_DIR,{recursive:true}); const tmp=`${USERS_FILE}.${process.pid}.tmp`; await fs.writeFile(tmp,JSON.stringify(store,null,2),{encoding:'utf8',mode:0o600}); await fs.rename(tmp,USERS_FILE); }); return writeQueue;
 }
-
 async function mutateUsers(mutator) {
-  let result;
-  writeQueue = writeQueue.then(async () => {
-    const store = await loadUsers();
-    result = await mutator(store);
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    const tempPath = `${USERS_FILE}.${process.pid}.tmp`;
-    await fs.writeFile(tempPath, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(tempPath, USERS_FILE);
-  });
-  await writeQueue;
-  return result;
+  if (databasePool()) return dbMutate('users',{users:[]},mutator);
+  let result; writeQueue=writeQueue.then(async()=>{ const store=await loadUsers(); result=await mutator(store); await fs.mkdir(DATA_DIR,{recursive:true}); const tmp=`${USERS_FILE}.${process.pid}.tmp`; await fs.writeFile(tmp,JSON.stringify(store,null,2),{encoding:'utf8',mode:0o600}); await fs.rename(tmp,USERS_FILE); }); await writeQueue; return result;
 }
 
 async function hashPassword(password) {
@@ -285,27 +292,84 @@ function adminAuthorized(req) {
 }
 
 async function loadInquiries() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    const raw = await fs.readFile(INQUIRIES_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (error) {
-    if (error.code === 'ENOENT') return [];
-    throw new Error('No se pudo leer el registro de consultas.');
-  }
+  if (databasePool()) return dbRead('inquiries', []);
+  await fs.mkdir(DATA_DIR,{recursive:true}); try { const raw=await fs.readFile(INQUIRIES_FILE,'utf8'); const parsed=JSON.parse(raw); return Array.isArray(parsed)?parsed:[]; } catch(error) { if(error.code==='ENOENT') return []; throw new Error('No se pudo leer el registro de consultas.'); }
+}
+async function appendInquiry(item) {
+  if (databasePool()) return dbMutate('inquiries',[],items=>{items.push(item); return true;});
+  writeQueue=writeQueue.then(async()=>{ const items=await loadInquiries(); items.push(item); await fs.mkdir(DATA_DIR,{recursive:true}); const tmp=`${INQUIRIES_FILE}.${process.pid}.tmp`; await fs.writeFile(tmp,JSON.stringify(items,null,2),{encoding:'utf8',mode:0o600}); await fs.rename(tmp,INQUIRIES_FILE); }); return writeQueue;
 }
 
-function appendInquiry(item) {
-  writeQueue = writeQueue.then(async () => {
-    const items = await loadInquiries();
-    items.push(item);
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    const tempPath = `${INQUIRIES_FILE}.${process.pid}.tmp`;
-    await fs.writeFile(tempPath, JSON.stringify(items, null, 2), { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(tempPath, INQUIRIES_FILE);
-  });
-  return writeQueue;
+async function loadOrders() {
+  if (databasePool()) return dbRead('orders', []);
+  await fs.mkdir(DATA_DIR,{recursive:true}); try { const parsed=JSON.parse(await fs.readFile(ORDERS_FILE,'utf8')); return Array.isArray(parsed)?parsed:[]; } catch(error) { if(error.code==='ENOENT') return []; throw new Error('No se pudo leer el registro de pedidos.'); }
+}
+function mutateOrders(mutator) {
+  if (databasePool()) return dbMutate('orders',[],mutator);
+  let result; writeQueue=writeQueue.then(async()=>{ const orders=await loadOrders(); result=await mutator(orders); await fs.mkdir(DATA_DIR,{recursive:true}); const tmp=`${ORDERS_FILE}.${process.pid}.tmp`; await fs.writeFile(tmp,JSON.stringify(orders,null,2),{encoding:'utf8',mode:0o600}); await fs.rename(tmp,ORDERS_FILE); }); return writeQueue.then(()=>result);
+}
+
+function mercadoPagoConfigured() {
+  return Boolean(process.env.MP_ACCESS_TOKEN && process.env.MP_PRICE_UYU && /^\d+(\.\d{1,2})?$/.test(process.env.MP_PRICE_UYU) && process.env.SITE_URL && /^https:\/\//i.test(process.env.SITE_URL));
+}
+function mpPrice() { return Number(process.env.MP_PRICE_UYU || 0).toFixed(2); }
+async function mercadoPagoRequest(method, endpoint, body, idempotencyKey) {
+  if (!mercadoPagoConfigured()) throw Object.assign(new Error('Mercado Pago todavía no está configurado por el administrador.'),{statusCode:503});
+  const headers={ Authorization:`Bearer ${process.env.MP_ACCESS_TOKEN}`, Accept:'application/json', 'Content-Type':'application/json' };
+  if(idempotencyKey) headers['X-Idempotency-Key']=idempotencyKey;
+  const response=await fetch(`https://api.mercadopago.com${endpoint}`,{method,headers,...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(25000)});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok){ console.error(`[mercadopago] ${method} ${endpoint} respondió ${response.status}: ${String(data.message||data.error||'error').slice(0,180)}`); throw Object.assign(new Error('Mercado Pago no pudo procesar la operación. Revisá la configuración del comercio o intentá más tarde.'),{statusCode:response.status>=500?502:400}); }
+  return data;
+}
+async function createMercadoPagoCheckout(user) {
+  const site=new URL(process.env.SITE_URL);
+  const localOrderId=crypto.randomUUID();
+  const amount=mpPrice();
+  const order=await mercadoPagoRequest('POST','/v1/orders',{
+    type:'online', processing_mode:'manual', capture_mode:'automatic', total_amount:amount,
+    external_reference:localOrderId, description:'SAE RADAR — licencia de compra única y actualizaciones',
+    payer:{email:user.email}, items:[{title:'SAE RADAR — licencia y actualizaciones',quantity:1,unit_price:amount}],
+    config:{online:{success_url:new URL('/?mp=return',site).toString(),failure_url:new URL('/?mp=failure',site).toString(),pending_url:new URL('/?mp=pending',site).toString(),auto_return:'approved'}}
+  },crypto.randomUUID());
+  if(!order.id || !order.checkout_url || !/^https:\/\//i.test(order.checkout_url) || Number(order.total_amount).toFixed(2)!==amount || order.currency!=='UYU') {
+    console.error('[mercadopago] La orden devuelta no coincide con importe/divisa/URL esperados.');
+    throw Object.assign(new Error('No pudimos validar la orden de Mercado Pago. No continúes con el pago.'),{statusCode:502});
+  }
+  await mutateOrders(items=>{items.push({id:order.id,externalReference:localOrderId,userId:user.id,status:'created',amount,currency:'UYU',provider:'mercadopago',createdAt:new Date().toISOString()});});
+  return {orderID:order.id,checkoutUrl:order.checkout_url};
+}
+async function verifyAndGrantMercadoPagoOrder(user, orderId) {
+  if(typeof orderId!=='string' || !/^ORD[A-Z0-9]{10,60}$/i.test(orderId)) throw Object.assign(new Error('Identificador de orden inválido.'),{statusCode:400});
+  const localOrders=await loadOrders(); const local=localOrders.find(x=>x.id===orderId && x.userId===user.id && x.provider==='mercadopago');
+  if(!local) throw Object.assign(new Error('La orden no pertenece a esta cuenta SAE RADAR.'),{statusCode:404});
+  const order=await mercadoPagoRequest('GET',`/v1/orders/${encodeURIComponent(orderId)}`);
+  if(order.external_reference!==local.externalReference || Number(order.total_amount).toFixed(2)!==local.amount || Number(order.total_paid_amount).toFixed(2)!==local.amount || order.currency!=='UYU') throw Object.assign(new Error('Mercado Pago todavía no confirmó el importe completo. No se habilitó el acceso.'),{statusCode:409});
+  if(order.status!=='processed' || order.status_detail!=='accredited') throw Object.assign(new Error('El pago todavía no está acreditado. No se habilitó el acceso.'),{statusCode:409});
+  const updated=await mutateUsers(store=>{const account=store.users.find(x=>x.id===user.id); if(!account)return null; if(!account.hasAccess){account.hasAccess=true;account.purchasedAt=new Date().toISOString();account.purchaseProvider='mercadopago';account.mercadoPagoOrderId=orderId;account.purchaseAmount=local.amount;account.purchaseCurrency='UYU';} return account;});
+  if(!updated) throw Object.assign(new Error('El pago fue acreditado, pero no pudimos actualizar la cuenta. Contactá soporte.'),{statusCode:500});
+  await mutateOrders(items=>{const saved=items.find(x=>x.id===orderId);if(saved){saved.status='processed';saved.statusDetail='accredited';saved.completedAt=new Date().toISOString();}});
+  return {ok:true,user:publicUser(updated),message:'Pago acreditado. SAE RADAR ya está vinculado a tu cuenta.'};
+}
+function verifyMercadoPagoWebhookSignature(req, dataId) {
+  const secret=process.env.MP_WEBHOOK_SECRET; if(!secret) return false;
+  const signature=String(req.headers['x-signature']||''); const requestId=String(req.headers['x-request-id']||'');
+  const parts=Object.fromEntries(signature.split(',').map(x=>x.trim().split('=')));
+  if(!parts.ts || !parts.v1 || !dataId || !requestId) return false;
+  const manifest=`id:${String(dataId).toLowerCase()};request-id:${requestId};ts:${parts.ts};`;
+  const expected=crypto.createHmac('sha256',secret).update(manifest).digest();
+  let received; try{received=Buffer.from(parts.v1,'hex')}catch{return false}
+  return received.length===expected.length && crypto.timingSafeEqual(received,expected);
+}
+async function processMercadoPagoWebhook(req, dataId) {
+  const order=await mercadoPagoRequest('GET',`/v1/orders/${encodeURIComponent(dataId)}`);
+  const localOrders=await loadOrders(); const local=localOrders.find(x=>x.id===order.id && x.provider==='mercadopago');
+  if(!local || order.external_reference!==local.externalReference || Number(order.total_amount).toFixed(2)!==local.amount || Number(order.total_paid_amount).toFixed(2)!==local.amount || order.currency!=='UYU') return false;
+  if(order.status!=='processed' || order.status_detail!=='accredited') return true;
+  const updated=await mutateUsers(store=>{const account=store.users.find(x=>x.id===local.userId);if(!account)return null;if(!account.hasAccess){account.hasAccess=true;account.purchasedAt=new Date().toISOString();account.purchaseProvider='mercadopago';account.mercadoPagoOrderId=order.id;account.purchaseAmount=local.amount;account.purchaseCurrency='UYU';}return account;});
+  if(!updated) return false;
+  await mutateOrders(items=>{const saved=items.find(x=>x.id===order.id);if(saved){saved.status='processed';saved.statusDetail='accredited';saved.completedAt=new Date().toISOString();}});
+  return true;
 }
 
 function downloadLatest(req, res, user) {
@@ -365,11 +429,11 @@ function createServer() {
     const pathname = url.pathname;
     try {
       if (pathname === '/api/health' && req.method === 'GET') {
-        return sendJson(res, 200, { ok: true, service: 'SAE LIVE RADAR website', accountsEnabled: true, paymentsEnabled: false, productVersion: PRODUCT_VERSION });
+        return sendJson(res, 200, { ok: true, service: 'SAE LIVE RADAR website', accountsEnabled: true, paymentsEnabled: mercadoPagoConfigured(), productVersion: PRODUCT_VERSION });
       }
       if (pathname === '/api/auth/me' && req.method === 'GET') {
         const user = await getCurrentUser(req);
-        return sendJson(res, 200, { authenticated: Boolean(user), user: user ? publicUser(user) : null, product: { name: 'SAE RADAR', price: 4.99, currency: 'USD', version: PRODUCT_VERSION, downloadAvailable: Boolean(RADAR_DOWNLOAD_FILE) } });
+        return sendJson(res, 200, { authenticated: Boolean(user), user: user ? publicUser(user) : null, product: { name: 'SAE RADAR', price: 4.99, currency: 'UYU', version: PRODUCT_VERSION, downloadAvailable: Boolean(RADAR_DOWNLOAD_FILE), paymentsEnabled: mercadoPagoConfigured() } });
       }
       if (pathname === '/api/auth/register' && req.method === 'POST') {
         assertSameOrigin(req);
@@ -416,7 +480,26 @@ function createServer() {
         const user = await getCurrentUser(req);
         if (!user) return sendJson(res, 401, { error: 'login_required', message: 'Iniciá sesión o creá una cuenta antes de comprar.' });
         if (user.hasAccess) return sendJson(res, 409, { error: 'already_owned', message: 'Esta cuenta ya tiene SAE RADAR. Podés descargar las actualizaciones desde tu cuenta.' });
-        return sendJson(res, 503, { error: 'checkout_not_configured', message: 'La cuenta está lista, pero el checkout todavía no está conectado. No se realizó ningún cobro.' });
+        if (!mercadoPagoConfigured()) return sendJson(res, 503, { error: 'checkout_not_configured', message: 'Mercado Pago todavía no está configurado. No se realizó ningún cobro.' });
+        if (isRateLimited(`checkout:${user.id}:${requestIp(req)}`, 8)) return sendJson(res, 429, { error: 'checkout_rate_limited', message: 'Demasiados intentos de compra. Probá más tarde.' }, { 'Retry-After': '3600' });
+        const checkout = await createMercadoPagoCheckout(user);
+        return sendJson(res, 200, { ok: true, ...checkout });
+      }
+      if (pathname === '/api/checkout/confirm' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const user = await getCurrentUser(req);
+        if (!user) return sendJson(res, 401, { error: 'login_required', message: 'Iniciá sesión para confirmar la compra.' });
+        if (!mercadoPagoConfigured()) return sendJson(res, 503, { error: 'checkout_not_configured', message: 'Mercado Pago todavía no está configurado.' });
+        if (isRateLimited(`capture:${user.id}:${requestIp(req)}`, 12)) return sendJson(res, 429, { error: 'capture_rate_limited', message: 'Demasiados intentos de verificación. Probá más tarde.' }, { 'Retry-After': '3600' });
+        const body = await readJsonBody(req);
+        const result = await verifyAndGrantMercadoPagoOrder(user, body.orderID);
+        return sendJson(res, 200, result);
+      }
+      if (pathname === '/api/mercadopago/webhook' && req.method === 'POST') {
+        const dataId = url.searchParams.get('data.id') || '';
+        if (url.searchParams.get('type') !== 'order' || !verifyMercadoPagoWebhookSignature(req, dataId)) return sendJson(res, 401, { error: 'invalid_signature' });
+        const accepted = await processMercadoPagoWebhook(req, dataId);
+        return sendJson(res, accepted ? 200 : 404, { ok: accepted });
       }
       if (pathname === '/api/download/latest' && req.method === 'GET') {
         const user = await getCurrentUser(req);
@@ -471,14 +554,17 @@ if (require.main === module) {
     console.error('ERROR: configurá SESSION_SECRET con al menos 32 caracteres antes de usar cuentas en producción.');
     process.exit(1);
   }
+  initDatabase().then(() => {
   const server = createServer();
   server.listen(PORT, HOST, () => {
     console.log(`SAE LIVE RADAR website listening on ${HOST}:${PORT}`);
     console.log('Accounts enabled: yes');
-    console.log('Payments enabled: no (payment provider not configured)');
-    if (!process.env.DATA_DIR) console.warn('WARNING: DATA_DIR no está definido; en hosting efímero las cuentas se pueden perder al reiniciar.');
+    console.log(`Database: ${databasePool() ? 'PostgreSQL connected' : 'local JSON (development only)'}`);
+    console.log(`Payments enabled: ${mercadoPagoConfigured() ? 'yes (Mercado Pago Orders)' : 'no (Mercado Pago variables missing)'}`);
+    if (!databasePool()) console.warn('WARNING: DATABASE_URL no está definido; no uses este modo en hosting efímero ni vendas.');
     if (process.env.NODE_ENV !== 'production' && !process.env.SESSION_SECRET) console.warn('WARNING: SESSION_SECRET temporal de desarrollo; las sesiones se invalidan al reiniciar.');
   });
+  }).catch(error => { console.error('[startup] ' + error.message); process.exit(1); });
 }
 
-module.exports = { validateInquiry, cleanString, getMimeType, parsePort, validateEmail, validatePassword, verifySession, createServer };
+module.exports = { validateInquiry, cleanString, getMimeType, parsePort, validateEmail, validatePassword, verifySession, createServer, mercadoPagoConfigured, verifyMercadoPagoWebhookSignature };

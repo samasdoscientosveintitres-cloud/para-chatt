@@ -1,73 +1,29 @@
-# SAE RADAR Website v1.1
+# SAE LIVE RADAR WEBSITE v1.3.0
 
-Landing page, account registration/login, purchase entitlement tracking and a protected update-download endpoint for SAE RADAR.
+Sitio comercial SAE RADAR con cuentas, derecho de compra/actualizaciones, Mercado Pago Checkout Pro vía Orders API y persistencia PostgreSQL (Neon).
 
-## Run locally
+## Render
+- Root Directory: carpeta del sitio web.
+- Build: `npm install`
+- Start: `npm start`
+- Requerido en producción: `DATABASE_URL`, `SESSION_SECRET`, `ADMIN_TOKEN`, `SITE_URL`, `MP_ACCESS_TOKEN`, `MP_PRICE_UYU`, `MP_WEBHOOK_SECRET`.
+- `RADAR_DOWNLOAD_FILE`: ruta absoluta al instalador privado fuera de `public/`.
 
-Requirements: Node.js 20 or newer.
+## Neon
+Crear un proyecto PostgreSQL en Neon y configurar la cadena de conexión pooled en `DATABASE_URL`. En el primer inicio el servidor crea `sae_radar_state` y sus claves iniciales. Usuarios, órdenes y consultas se almacenan como JSONB por colección. En producción el servidor no inicia si falta `DATABASE_URL`.
 
-```bash
-npm start
-```
+## Mercado Pago Checkout Pro — Orders API
+1. La cuenta del tutor crea la aplicación y obtiene su Access Token de producción. Nunca publicar ni compartir el token.
+2. Configurar `MP_ACCESS_TOKEN` en Render.
+3. Configurar `MP_PRICE_UYU` con el importe final fijo en pesos uruguayos (ejemplo de formato `199.00`; elegir el importe comercial real según el precio publicado). La página mantiene US$4.99 como referencia visual, pero el cobro es en UYU; no hay conversión automática.
+4. Configurar `SITE_URL` con la URL HTTPS real del sitio.
+5. En Mercado Pago > Configuración de Webhooks, seleccionar Producción, evento Order, y usar `https://TU-SITIO/api/mercadopago/webhook`. Copiar la firma secreta generada a `MP_WEBHOOK_SECRET`.
+6. El servidor valida la firma HMAC, consulta la order en Mercado Pago y solo otorga acceso si la order está `processed` / `accredited`, `total_paid_amount` coincide con `MP_PRICE_UYU`, la moneda es UYU y la referencia externa corresponde a una orden de esa cuenta.
 
-Open `http://localhost:8080`.
+El botón no concede acceso por el simple retorno del checkout. La compra se verifica contra la API oficial. Las credenciales solo se configuran por el adulto titular de la cuenta del comercio.
 
-For persistent local data, the app writes `data/users.json`. The account password is never stored in plain text: it is derived with Node's `scrypt` and a unique salt. Sessions are signed server-side and placed in an HttpOnly, SameSite=Lax cookie.
-
-## Environment variables
-
-Copy `.env.example` to `.env` and set independent random secrets:
-
-- `SESSION_SECRET`: at least 32 random characters. Required in production; rotating it invalidates active sessions.
-- `ADMIN_TOKEN`: at least 32 random characters. Used only for private admin endpoints.
-- `DATA_DIR`: persistent directory for `users.json` and `inquiries.json`. On hosting, mount a persistent disk and point this variable to its mount path.
-- `RADAR_DOWNLOAD_FILE`: absolute path to the current installer on the server. Keep installers outside `public/`; the download route checks the logged-in account's entitlement before streaming the file.
-- `PRODUCT_VERSION`: version displayed by the account API.
-
-Do not commit `.env`, `users.json`, purchase data, tokens, or installers to a public repository.
-
-## Account and entitlement flow
-
-- `POST /api/auth/register`: creates an account and signs in the new user.
-- `POST /api/auth/login`: verifies the email/password and signs in.
-- `GET /api/auth/me`: returns the current account and whether SAE RADAR access is recorded.
-- `POST /api/auth/logout`: clears the session cookie.
-- `POST /api/checkout`: requires a logged-in account. It deliberately returns `503 checkout_not_configured` until a payment provider and verified payment webhook are implemented. It does not collect card information or mark anyone as paid.
-- `POST /api/admin/grant-access`: private manual entitlement grant. Requires `Authorization: Bearer ADMIN_TOKEN` and JSON `{ "email": "buyer@example.com" }`. This is intended for controlled manual testing or confirmed manual payments only.
-- `GET /api/download/latest`: sends the installer only if the account has `hasAccess: true` and `RADAR_DOWNLOAD_FILE` is configured.
-
-Example manual access grant (run from a trusted admin terminal only):
-
-```bash
-curl -X POST https://YOUR-DOMAIN/api/admin/grant-access \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"buyer@example.com"}'
-```
-
-There is intentionally no public endpoint that can grant access. The admin grant endpoint does not revoke access.
-
-## Important production requirements before taking real payments
-
-This version has account creation, login and server-side entitlement checks, but **payments are disabled**. The displayed US$4.99 is product-page pricing only; no money can be collected by this build. Do not tell customers they have paid or send them to an unconfigured checkout.
-
-Before public sales, an adult responsible for the business/payment account should select and configure a payment provider, verify signed payment webhooks server-side, and grant access only after confirmed successful payment. Also add email verification, password recovery, a support contact, clear terms/refund policy and privacy notice. The current email-based account is not email-verified and has no self-service password reset.
-
-For a production deployment, use a persistent disk or database for `DATA_DIR`. If the host's filesystem is ephemeral, accounts and purchase entitlements can disappear after a redeploy/restart. Back up account data securely.
-
-## Tests
-
-```bash
-npm test
-```
-
-## Endpoints
-
-- `GET /api/health`
-- `GET /api/auth/me`
-- `POST /api/auth/register`
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
-- `POST /api/checkout`
-- `GET /api/download/latest`
-- `POST /api/admin/grant-access`
+## Seguridad y operación
+- Nunca pedir ni almacenar datos de tarjetas. Checkout ocurre en Mercado Pago.
+- No compartir `MP_ACCESS_TOKEN`, `MP_WEBHOOK_SECRET`, `DATABASE_URL`, `SESSION_SECRET` ni `ADMIN_TOKEN`.
+- No habilitar ventas reales hasta que el tutor complete la verificación del comercio, configure el webhook de producción, pruebe una compra y configure el instalador privado.
+- El producto se muestra como US$4.99, pero el importe real se fija en UYU. Revisar y mostrar claramente el precio final en UYU antes de publicar.

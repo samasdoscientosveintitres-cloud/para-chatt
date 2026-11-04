@@ -19,6 +19,7 @@ const toast = $('toast');
 let authMode = 'login';
 let currentUser = null;
 let downloadAvailable = false;
+let paymentsEnabled = false;
 let toastTimer = null;
 
 document.getElementById('year').textContent = new Date().getFullYear();
@@ -129,8 +130,16 @@ function updateAccountUI() {
     planStatus.textContent = 'Esta cuenta ya tiene SAE RADAR. Las actualizaciones se descargan desde Mi cuenta.';
     $('buyButton').innerHTML = 'SAE RADAR comprado <span>✓</span>';
   } else {
-    planStatus.textContent = `Sesión iniciada como ${currentUser.email}. Ya podés continuar con la compra.`;
+    planStatus.textContent = paymentsEnabled
+      ? `Sesión iniciada como ${currentUser.email}. Ya podés continuar con la compra.`
+      : `Sesión iniciada como ${currentUser.email}. El checkout de Mercado Pago todavía no está habilitado.`;
     $('buyButton').textContent = 'Comprar SAE RADAR';
+  }
+  const note = $('pricingNote');
+  if (note) {
+    note.textContent = paymentsEnabled
+      ? 'El pago se procesa en Mercado Pago. SAE RADAR se habilita únicamente después de confirmar el cobro.'
+      : 'El checkout todavía no está configurado. No se realizará ningún cobro hasta que el administrador habilite Mercado Pago.';
   }
 }
 
@@ -139,6 +148,7 @@ async function refreshSession() {
     const result = await api('/api/auth/me');
     currentUser = result.authenticated ? result.user : null;
     downloadAvailable = Boolean(result.product?.downloadAvailable);
+    paymentsEnabled = Boolean(result.product?.paymentsEnabled);
   } catch {
     currentUser = null;
   }
@@ -158,14 +168,59 @@ $('buyButton').addEventListener('click', async () => {
   }
   const button = $('buyButton');
   button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = 'Conectando con Mercado Pago…';
   try {
-    await api('/api/checkout', { method: 'POST', body: '{}' });
+    const checkout = await api('/api/checkout', { method: 'POST', body: '{}' });
+    if (!checkout.checkoutUrl || !/^https:\/\//i.test(checkout.checkoutUrl)) {
+      throw new Error('Mercado Pago no devolvió un enlace de pago válido.');
+    }
+    window.location.assign(checkout.checkoutUrl);
   } catch (error) {
-    showToast(error.message || 'El checkout todavía no está disponible.', true);
-  } finally {
+    showToast(error.message || 'No se pudo iniciar el pago.', true);
     button.disabled = false;
+    button.textContent = originalLabel || 'Comprar SAE RADAR';
   }
 });
+
+async function handleMercadoPagoReturn() {
+  const url = new URL(window.location.href);
+  const mpState = url.searchParams.get('mp');
+  if (mpState === 'failure' || mpState === 'pending') {
+    history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+    showToast(mpState === 'pending' ? 'El pago está pendiente. El acceso se habilitará cuando Mercado Pago lo acredite.' : 'El pago no se completó. No se habilitó el acceso.');
+    return;
+  }
+  if (mpState !== 'return') return;
+  const orderID = url.searchParams.get('order_id');
+  if (!currentUser) {
+    openAuthModal('login');
+    authStatus.textContent = 'Volviste de Mercado Pago. Iniciá sesión con la misma cuenta SAE RADAR para verificar el pago.';
+    authStatus.classList.remove('error');
+    return;
+  }
+  if (!orderID) {
+    await refreshSession();
+    if (currentUser?.hasAccess) { showToast('Pago acreditado. SAE RADAR ya está vinculado a tu cuenta.'); return; }
+    showToast('Volviste de Mercado Pago. Estamos esperando la confirmación del pago; no vuelvas a pagar todavía.');
+    return;
+  }
+  try {
+    showToast('Verificando el pago con Mercado Pago…');
+    const result = await api('/api/checkout/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ orderID })
+    });
+    currentUser = result.user || currentUser;
+    history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+    updateAccountUI();
+    openAuthModal('login');
+    showAccountPanel();
+    showToast(result.message || 'Pago confirmado. SAE RADAR ya está vinculado a tu cuenta.');
+  } catch (error) {
+    showToast(error.message || 'No se pudo confirmar el pago. No vuelvas a pagar todavía; contactá al soporte.', true);
+  }
+}
 
 authForm.addEventListener('submit', async event => {
   event.preventDefault();
@@ -187,6 +242,7 @@ authForm.addEventListener('submit', async event => {
     await refreshSession();
     authForm.reset();
     updateAccountUI();
+    await handleMercadoPagoReturn();
     showAccountPanel();
     authStatus.textContent = '';
     showToast(authMode === 'register' ? 'Cuenta creada. Ya podés volver a Planes para comprar.' : 'Sesión iniciada correctamente.');
@@ -234,4 +290,4 @@ downloadButton.addEventListener('click', async () => {
   }
 });
 
-refreshSession();
+refreshSession().then(handleMercadoPagoReturn);

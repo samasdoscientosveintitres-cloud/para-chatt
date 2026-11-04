@@ -6,9 +6,23 @@ services:
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: SESSION_SECRET
         generateValue: true
       - key: ADMIN_TOKEN
         generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: MP_ACCESS_TOKEN
+        sync: false
+      - key: MP_PRICE_UYU
+        sync: false
+      - key: MP_WEBHOOK_SECRET
+        sync: false
+      - key: SITE_URL
+        sync: false
       - key: PRODUCT_VERSION
         value: 0.2.0
+      - key: RADAR_DOWNLOAD_FILE
+        sync: false

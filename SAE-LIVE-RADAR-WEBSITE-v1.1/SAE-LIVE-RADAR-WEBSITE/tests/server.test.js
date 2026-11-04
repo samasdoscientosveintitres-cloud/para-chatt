@@ -10,7 +10,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sae-radar-test-'))
 process.env.SESSION_SECRET = 'test-session-secret-please-change-this-123456789';
 process.env.ADMIN_TOKEN = 'test-admin-token-please-change-this-123456789';
 
-const { validateInquiry, cleanString, getMimeType, parsePort, validateEmail, validatePassword, createServer } = require('../server');
+const { validateInquiry, cleanString, getMimeType, parsePort, validateEmail, validatePassword, createServer, verifyMercadoPagoWebhookSignature } = require('../server');
 
 test('valid inquiry is normalized', () => {
   const result = validateInquiry({ name: '  Sam  ', contact: 'sam@example.com', requestType: 'beta', message: '  Quiero probar  ', consent: 'on' });
@@ -102,4 +102,20 @@ test('accounts require login, preserve purchase entitlement and protect download
     body: JSON.stringify({ email: 'buyer@example.com', password: 'secure-passphrase-123' })
   });
   assert.equal(login.status, 200);
+});
+
+
+test('Mercado Pago webhook signatures are validated against the official manifest', () => {
+  const crypto = require('node:crypto');
+  const secret = 'test-webhook-secret';
+  process.env.MP_WEBHOOK_SECRET = secret;
+  const dataId = 'ORD01ABCDEF1234567890';
+  const requestId = 'req-123';
+  const ts = '1742505638683';
+  const manifest = `id:${dataId.toLowerCase()};request-id:${requestId};ts:${ts};`;
+  const hash = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
+  const req = { headers: { 'x-signature': `ts=${ts},v1=${hash}`, 'x-request-id': requestId } };
+  assert.equal(verifyMercadoPagoWebhookSignature(req, dataId), true);
+  assert.equal(verifyMercadoPagoWebhookSignature(req, 'ORD01WRONG1234567890'), false);
+  delete process.env.MP_WEBHOOK_SECRET;
 });
